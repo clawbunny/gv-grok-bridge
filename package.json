@@ -1,0 +1,38 @@
+{
+  "name": "gv-grok-bridge",
+  "version": "1.0.0",
+  "description": "Bridge Google Voice incoming calls to Grok AI voice mode via Chromium + PulseAudio",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node node_modules/typescript/bin/tsc",
+    "start": "node dist/main.js",
+    "dev": "ts-node src/main.ts",
+    "setup": "bash setup.sh",
+    "lint": "node node_modules/typescript/bin/tsc --noEmit",
+    "test": "node node_modules/jest/bin/jest.js --verbose",
+    "test:watch": "node node_modules/jest/bin/jest.js --watch",
+    "test:coverage": "node node_modules/jest/bin/jest.js --coverage"
+  },
+  "keywords": [
+    "google-voice",
+    "grok",
+    "voice-bridge",
+    "playwright",
+    "pulseaudio"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "playwright": "^1.40.0"
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20.10.0",
+    "jest": "^30.4.2",
+    "ts-jest": "^29.4.11",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.3.0"
+  }
+}

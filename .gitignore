@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+dist/
+coverage/
+*.tsbuildinfo
+
+# Logs
+*.log
+bridge.log
+
+# Environment
+.env
+.env.local
+
+# Runtime/temp profiles
+/tmp/gv-grok-bridge/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
