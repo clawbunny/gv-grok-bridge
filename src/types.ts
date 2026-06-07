@@ -1,23 +1,34 @@
 /**
- * Shared TypeScript types for the GV-Grok Bridge
+ * Shared TypeScript types for the GV Bridge
  */
 
 import type { LogLevel } from './logger';
 export type { LogLevel };
 
 // ──────────────────────────────────────────
+// Provider Types
+// ──────────────────────────────────────────
+
+export interface ProviderRef {
+  /** Provider type identifier, e.g. 'google-voice' or 'grok' */
+  type: string;
+  /** Provider-specific configuration object */
+  config?: Record<string, unknown>;
+}
+
+// ──────────────────────────────────────────
 // Audio Pipeline Types
 // ──────────────────────────────────────────
 
 export interface AudioDevices {
-  /** module ID for pipe_gv_to_grok null-sink */
-  gvSink: number;
-  /** module ID for pipe_grok_to_gv null-sink */
-  grokSink: number;
-  /** module ID for src_gv_to_grok remap-source */
-  gvSource: number;
-  /** module ID for src_grok_to_gv remap-source */
-  grokSource: number;
+  /** module ID for voice->ai null-sink */
+  voiceSink: number;
+  /** module ID for ai->voice null-sink */
+  aiSink: number;
+  /** module ID for voice->ai remap-source */
+  voiceSource: number;
+  /** module ID for ai->voice remap-source */
+  aiSource: number;
 }
 
 // ──────────────────────────────────────────
@@ -42,26 +53,22 @@ export interface BrowserConfig {
 }
 
 export interface BrowserPair {
-  gv: BrowserContext;
-  grok: BrowserContext;
-  gvPage: Page;
-  grokPage: Page;
+  voice: BrowserContext;
+  ai: BrowserContext;
+  voicePage: Page;
+  aiPage: Page;
+}
+
+export interface ProviderBrowserConfig {
+  voiceUrl: string;
+  aiUrl: string;
+  voiceOrigin: string;
+  aiOrigin: string;
 }
 
 // ──────────────────────────────────────────
-// Google Voice Monitor Types
+// Call Info
 // ──────────────────────────────────────────
-
-export interface VoiceConfig {
-  /** List of authorized phone numbers (E.164 format, e.g., +12125551234) */
-  authorizedNumbers: string[];
-  /** Also accept calls from contacts whose name contains these strings */
-  authorizedNames?: string[];
-  /** Auto-accept authorized calls */
-  autoAccept: boolean;
-  /** Poll interval in ms (default: 1000) */
-  pollInterval?: number;
-}
 
 export interface CallInfo {
   phoneNumber: string;
@@ -83,6 +90,10 @@ export type VoiceEventHandler = {
 // ──────────────────────────────────────────
 
 export interface BridgeConfig {
+  /** Instance identifier */
+  instanceId: string;
+  /** PulseAudio namespace for this instance */
+  namespace: string;
   /** Path to default Chromium profile */
   defaultProfilePath: string;
   /** Path to copy profile for second browser instance */
@@ -103,15 +114,19 @@ export interface BridgeConfig {
   extraArgs?: string[];
   /** Log level */
   logLevel: LogLevel;
+  /** Voice provider reference */
+  voiceProvider: ProviderRef;
+  /** AI provider reference */
+  aiProvider: ProviderRef;
 }
 
 export interface BridgeStatus {
   running: boolean;
   audioReady: boolean;
-  gvBrowserReady: boolean;
-  grokBrowserReady: boolean;
-  gvLoggedIn: boolean;
-  grokLoggedIn: boolean;
+  voiceBrowserReady: boolean;
+  aiBrowserReady: boolean;
+  voiceLoggedIn: boolean;
+  aiLoggedIn: boolean;
   inCall: boolean;
   currentCall?: CallInfo;
   voiceModeActive: boolean;
@@ -127,9 +142,9 @@ export type BridgeState =
   | 'CHECK_AUTH'
   | 'ACCEPT_CALL'
   | 'WAITING_CALL_ACTIVE'
-  | 'ACTIVATE_GROK'
+  | 'ACTIVATE_AI'
   | 'BRIDGED'
   | 'CALL_ENDING'
-  | 'DEACTIVATE_GROK'
+  | 'DEACTIVATE_AI'
   | 'ERROR'
   | 'SHUTDOWN';

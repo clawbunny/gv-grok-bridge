@@ -1,5 +1,10 @@
 # Research Notes — Google Voice ↔ Grok Bridge
 
+> **DEPRECATED — This document reflects the v1 single-provider architecture.**
+>
+> The project now supports multiple voice and AI providers via a modular
+> plugin system. See `docs/providers.md` for current provider documentation.
+
 ## Google Voice (voice.google.com)
 
 ### DOM Structure for Incoming Calls

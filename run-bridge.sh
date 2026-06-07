@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run the GV-Grok Bridge
+# Run the GV Bridge (legacy single-instance wrapper)
+# For multi-instance mode, use: voicebridge <command>
 set -e
 
 export GV_AUTHORIZED_NUMBERS="${GV_AUTHORIZED_NUMBERS:-}"
@@ -22,9 +23,11 @@ if [ ! -d "dist" ]; then
   npm run build
 fi
 
-echo "[START] Starting GV-Grok Bridge..."
+echo "[START] Starting GV Bridge (legacy mode)..."
 echo "        Headless: $GV_HEADLESS"
 echo "        Display:  $GV_DISPLAY_NUM"
+echo ""
+echo "[TIP] For multi-instance mode, run: voicebridge setup"
 echo ""
 
 node dist/main.js

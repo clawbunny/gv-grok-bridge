@@ -1,16 +1,23 @@
 [Unit]
-Description=GV-Grok Bridge
+Description=GV Bridge — DEPRECATED single-instance service
+#
+# This file is kept for reference only.
+# For multi-instance management, use the CLI:
+#   voicebridge setup
+#   voicebridge start <instance-id>
+#   voicebridge enable <instance-id>
+#
+# Per-instance services are generated in:
+#   ~/.config/systemd/user/gv-bridge-<instanceId>.service
+#
 After=network-online.target systemd-user-sessions.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=gvgrok
-Group=gvgrok
-WorkingDirectory=/home/gvgrok/project
-Environment="HOME=/home/gvgrok"
-Environment="USER=gvgrok"
-Environment="XDG_RUNTIME_DIR=/run/user/1003"
+Environment="HOME=/home/%u"
+Environment="USER=%u"
+Environment="XDG_RUNTIME_DIR=/run/user/%U"
 Environment="GV_HEADLESS=true"
 Environment="GV_DISPLAY_NUM=:99"
 Environment="GV_AUTO_ACCEPT=true"
@@ -18,11 +25,11 @@ Environment="GV_LOG_LEVEL=info"
 Environment="GV_AUTHORIZED_NUMBERS=+1XXXXXXXXXX"
 Environment="PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
 ExecStartPre=-/usr/bin/bash -c "/usr/bin/pkill -9 -f 'chromium' 2>/dev/null || true"
-ExecStart=/usr/bin/node /home/gvgrok/project/dist/main.js
+ExecStart=/usr/bin/node %h/project/dist/main.js
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/home/gvgrok/project/bridge.log
-StandardError=append:/home/gvgrok/project/bridge.log
+StandardOutput=append:%h/project/bridge.log
+StandardError=append:%h/project/bridge.log
 
 [Install]
 WantedBy=multi-user.target

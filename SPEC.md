@@ -1,5 +1,10 @@
 # SPEC.md — Google Voice ↔ Grok Voice Bridge
 
+> **DEPRECATED — This document describes the v1 architecture.**
+>
+> The project has been rewritten with a modular, multi-instance architecture.
+> See `README.md` and `docs/providers.md` for current documentation.
+
 ## 1. Overview
 
 A headless Ubuntu application that bridges incoming Google Voice calls to Grok AI's voice mode. Two Chromium instances (Playwright + CDP) are connected via virtual PulseAudio devices so the caller talks to Grok AI bidirectionally. Audio never plays through physical speakers.

@@ -1,0 +1,45 @@
+#!/bin/bash
+# voicebridge-run — Single-instance runtime wrapper for GV Bridge
+# Usage: voicebridge-run
+#
+# Runs the legacy single-instance bridge using env vars.
+# For multi-instance mode, use: voicebridge setup / voicebridge start <id>
+
+set -e
+
+# Ensure systemd user session environment is available.
+# SSH logins may not set XDG_RUNTIME_DIR if pam_systemd is not configured.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  [[ $SCRIPT_SOURCE != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUN_ENTRY="$PROJECT_ROOT/dist/main.js"
+
+if [ ! -f "$RUN_ENTRY" ]; then
+  echo "[voicebridge-run] Building project..."
+  cd "$PROJECT_ROOT"
+  if ! node node_modules/typescript/bin/tsc >/dev/null 2>&1; then
+    echo "[voicebridge-run] Build failed. Run 'npm install' first?"
+    exit 1
+  fi
+  echo "[voicebridge-run] Build complete."
+fi
+
+if ! command -v node &>/dev/null; then
+  echo "[voicebridge-run] Node.js not found. Please install Node.js 20+."
+  exit 1
+fi
+
+exec node "$RUN_ENTRY" "$@"

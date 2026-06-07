@@ -5,7 +5,7 @@ export DISPLAY=${DISPLAY:-:3}
 chromium \
   --no-sandbox \
   --disable-gpu \
-  --user-data-dir=/home/gvgrok/.config/chromium \
+  --user-data-dir="${HOME}/.config/chromium" \
   --new-window \
   https://voice.google.com \
   https://grok.com &

@@ -1,68 +1,74 @@
-# How to Log In to Google Voice and Grok
+# How to Log In to Your Providers
 
-## Step 1: Connect to VNC
+Before the bridge can handle calls, you must be logged in to both your voice provider (e.g. Google Voice) and your AI provider (e.g. Grok) in Chromium.
 
-The gvgrok user has a VNC desktop running on display :3 (port 5903).
+## Prerequisites
 
-From your local machine, create an SSH tunnel:
+- GV Bridge is installed (`voicebridge` command is available)
+- Chromium is installed on the system
+
+## Step 1: Open Chromium
+
+Run Chromium with your default profile:
+
 ```bash
-ssh -i ~/.ssh/martin_dsd_890_be -L 5903:localhost:5903 martin@dsd.890.be
+chromium
 ```
 
-Then connect with any VNC viewer to:
-- Address: `localhost:5903`
-- Password: `<VNC_PASSWORD>`
+If you are running headless on a remote server, you may need to use X11 forwarding or a VNC desktop:
 
-## Step 2: Open Chromium and Log In
-
-Inside the VNC desktop, open a terminal and run:
 ```bash
-cd ~/project
-./open-browser.sh
+# X11 forwarding over SSH
+ssh -X your-server
+chromium
 ```
 
-This opens Chromium with two tabs:
-1. https://voice.google.com  -> Log in with your Google account
-2. https://grok.com          -> Log in with your x.ai account
+Or set up a VNC desktop if X11 forwarding is not available.
+
+## Step 2: Log In to Both Services
+
+1. Navigate to **https://voice.google.com** and log in with your Google account.
+2. Open a new tab and navigate to **https://grok.com** and log in with your x.ai account.
 
 ## Step 3: Close Chromium
 
-After logging in to BOTH services, **close Chromium completely**.
-The bridge needs the profile to be unlocked.
+After logging in to **BOTH** services, **close Chromium completely**.
 
-## Step 4: Configure Authorized Numbers
+The bridge needs the profile to be unlocked so it can launch its own Chromium instances.
 
-Set which callers are allowed:
+## Step 4: Create and Start a Bridge Instance
+
 ```bash
-export GV_AUTHORIZED_NUMBERS="+12125551234,+13035556789"
-export GV_AUTHORIZED_NAMES="Alice,Bob"
+# Interactive setup wizard
+voicebridge setup
+
+# Or specify everything on the command line
+voicebridge setup -i my-bridge -v google-voice -a grok -n "+12125551234"
+
+# Start the instance
+voicebridge start my-bridge
 ```
 
-## Step 5: Run the Bridge
+## Step 5: Verify It Is Working
+
 ```bash
-cd ~/project
-./run-bridge.sh
+# Check status
+voicebridge status my-bridge
+
+# Follow the logs
+voicebridge logs my-bridge -f
 ```
 
-The bridge will:
-1. Set up PulseAudio virtual audio devices
-2. Launch two Chromium instances (GV + Grok)
-3. Monitor for incoming calls
-4. Auto-answer authorized callers
-5. Bridge audio to Grok AI voice mode
+## Troubleshooting
 
-## Stopping the Bridge
+**"Not logged in" errors in logs:**
+- Re-open Chromium and verify you are still logged in.
+- Close Chromium before restarting the bridge.
 
-Press `Ctrl+C` to stop gracefully.
+**"Profile in use" errors:**
+- Make sure no other Chromium processes are running.
+- The install script and service file automatically kill lingering Chromium processes before starting.
 
-## VNC Password Change
-
-To change the VNC password:
-```bash
-vncpasswd
-```
-Then restart VNC:
-```bash
-vncserver -kill :3
-vncserver :3 -geometry 1280x800 -depth 24 -localhost yes
-```
+**Audio issues:**
+- Check your user is in the `audio` and `pulse` groups.
+- Verify PulseAudio is running: `pulseaudio --check || pulseaudio --start`

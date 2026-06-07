@@ -1,10 +1,12 @@
 #!/bin/bash
-# start.sh — Start the GV-Grok Bridge manually
+# start.sh — Legacy manual start script.
 #
-# NOTE: For production, use systemd instead:
-#   sudo systemctl start gv-grok-bridge
-#   sudo systemctl status gv-grok-bridge
-# This script is useful for development or debugging.
+# For multi-instance management, use the CLI instead:
+#   voicebridge setup
+#   voicebridge start <instance-id>
+#   voicebridge list
+#
+# This script starts a single legacy instance using env vars.
 
 set -e
 
@@ -38,9 +40,11 @@ fi
 pkill -9 -f 'chromium' 2>/dev/null || true
 
 # ── Start ──
-echo "[START] Starting GV-Grok Bridge..."
+echo "[START] Starting GV Bridge (legacy mode)..."
 echo "        Headless: ${GV_HEADLESS:-true}"
 echo "        Display:  ${GV_DISPLAY_NUM:-:99}"
+echo ""
+echo "[TIP] For multi-instance mode, run: voicebridge setup"
 echo ""
 
 node dist/main.js

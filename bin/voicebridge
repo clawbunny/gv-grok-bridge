@@ -1,0 +1,50 @@
+#!/bin/bash
+# voicebridge — CLI wrapper for GV Bridge
+# Usage: voicebridge <command> [args...]
+#
+# Resolves its own location (even through symlinks) to find the project root,
+# then delegates to the TypeScript CLI (building first if needed).
+
+set -e
+
+# Ensure systemd user session environment is available.
+# SSH logins may not set XDG_RUNTIME_DIR if pam_systemd is not configured.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$XDG_RUNTIME_DIR/bus" ]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
+
+# Resolve this script's real directory (follow symlinks)
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+  SCRIPT_SOURCE="$(readlink "$SCRIPT_SOURCE")"
+  [[ $SCRIPT_SOURCE != /* ]] && SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
+
+# Project root is one level above bin/
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CLI_ENTRY="$PROJECT_ROOT/dist/cli/main.js"
+
+# Auto-build if dist is missing or stale
+if [ ! -f "$CLI_ENTRY" ]; then
+  echo "[voicebridge] Building project..."
+  cd "$PROJECT_ROOT"
+  if ! node node_modules/typescript/bin/tsc >/dev/null 2>&1; then
+    echo "[voicebridge] Build failed. Run 'npm install' first?"
+    exit 1
+  fi
+  echo "[voicebridge] Build complete."
+fi
+
+# Ensure node is available
+if ! command -v node &>/dev/null; then
+  echo "[voicebridge] Node.js not found. Please install Node.js 20+."
+  exit 1
+fi
+
+# Delegate all args to the CLI
+exec node "$CLI_ENTRY" "$@"

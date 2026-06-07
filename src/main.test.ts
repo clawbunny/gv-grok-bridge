@@ -4,10 +4,11 @@
  */
 
 // Mock all dependencies before importing main
-jest.mock('./config', () => ({
-  loadConfig: jest.fn().mockReturnValue({
-    defaultProfilePath: '/home/user/.config/chromium',
-    tempProfilePath: '/tmp/grok-chromium-profile',
+jest.mock('./instance/registry', () => ({
+  loadInstance: jest.fn().mockReturnValue({
+    instanceId: 'test-instance',
+    voiceProvider: { type: 'google-voice' },
+    aiProvider: { type: 'grok' },
     authorizedNumbers: ['+15551234567'],
     authorizedNames: [],
     headless: true,
@@ -15,8 +16,26 @@ jest.mock('./config', () => ({
     autoAccept: true,
     pollInterval: 1000,
     logLevel: 'debug',
+    profilePath: '/home/user/.config/chromium',
   }),
-  validateConfig: jest.fn(),
+}));
+
+jest.mock('./instance/config', () => ({
+  instanceConfigToBridgeConfig: jest.fn().mockReturnValue({
+    instanceId: 'test-instance',
+    namespace: 'test_instance',
+    defaultProfilePath: '/home/user/.config/chromium',
+    tempProfilePath: '/tmp/test-chromium-profile',
+    authorizedNumbers: ['+15551234567'],
+    authorizedNames: [],
+    headless: true,
+    displayNum: ':99',
+    autoAccept: true,
+    pollInterval: 1000,
+    logLevel: 'debug',
+    voiceProvider: { type: 'google-voice' },
+    aiProvider: { type: 'grok' },
+  }),
 }));
 
 jest.mock('./logger', () => ({
@@ -28,15 +47,28 @@ jest.mock('./logger', () => ({
   })),
 }));
 
-jest.mock('./audio/pipeline', () => ({
+jest.mock('./providers', () => ({
+  getVoiceProvider: jest.fn().mockReturnValue({
+    id: 'google-voice',
+    url: 'https://voice.google.com',
+    origin: 'https://voice.google.com',
+  }),
+  getAIProvider: jest.fn().mockReturnValue({
+    id: 'grok',
+    url: 'https://grok.com',
+    origin: 'https://grok.com',
+  }),
+}));
+
+jest.mock('./runtime/audio/pipeline', () => ({
   AudioPipeline: jest.fn().mockImplementation(() => ({
-    setup: jest.fn().mockResolvedValue({ gvSink: 1, grokSink: 2, gvSource: 3, grokSource: 4 }),
+    setup: jest.fn().mockResolvedValue({ voiceSink: 1, aiSink: 2, voiceSource: 3, aiSource: 4 }),
     teardown: jest.fn().mockResolvedValue(undefined),
     fixStreamRouting: jest.fn().mockResolvedValue(undefined),
   })),
 }));
 
-jest.mock('./browser/manager', () => ({
+jest.mock('./runtime/browser/manager', () => ({
   BrowserManager: jest.fn().mockImplementation(() => ({
     launch: jest.fn().mockResolvedValue(undefined),
     close: jest.fn().mockResolvedValue(undefined),
@@ -46,7 +78,7 @@ jest.mock('./browser/manager', () => ({
   createBrowserLauncher: jest.fn().mockReturnValue(jest.fn()),
 }));
 
-jest.mock('./voice/monitor', () => ({
+jest.mock('./runtime/monitor', () => ({
   VoiceMonitor: jest.fn().mockImplementation(() => ({
     startMonitoring: jest.fn().mockResolvedValue(undefined),
     stopMonitoring: jest.fn().mockResolvedValue(undefined),
@@ -54,15 +86,15 @@ jest.mock('./voice/monitor', () => ({
   })),
 }));
 
-jest.mock('./grok/controller', () => ({
-  GrokController: jest.fn().mockImplementation(() => ({
+jest.mock('./runtime/ai-controller', () => ({
+  AIController: jest.fn().mockImplementation(() => ({
     initialize: jest.fn().mockResolvedValue(true),
     activateVoiceMode: jest.fn().mockResolvedValue(true),
     deactivateVoiceMode: jest.fn().mockResolvedValue(undefined),
   })),
 }));
 
-jest.mock('./bridge/xvfb', () => ({
+jest.mock('./runtime/xvfb', () => ({
   XvfbManager: jest.fn().mockImplementation(() => ({
     start: jest.fn().mockResolvedValue(undefined),
     stop: jest.fn(),
@@ -70,7 +102,7 @@ jest.mock('./bridge/xvfb', () => ({
   })),
 }));
 
-jest.mock('./bridge/orchestrator', () => ({
+jest.mock('./runtime/orchestrator', () => ({
   BridgeOrchestrator: jest.fn().mockImplementation(() => ({
     start: jest.fn().mockResolvedValue(undefined),
     stop: jest.fn().mockResolvedValue(undefined),
@@ -98,7 +130,6 @@ describe('main.ts signal handlers', () => {
   });
 
   it('registers SIGINT handler', async () => {
-    // Import main to trigger handler registration
     await import('./main');
     expect(handlers['SIGINT']).toBeDefined();
     expect(typeof handlers['SIGINT']).toBe('function');

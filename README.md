@@ -1,28 +1,24 @@
-# Google Voice ↔ Grok AI Voice Bridge
+# GV Bridge — Multi-Instance Voice Bridge
 
-An Ubuntu application that bridges incoming Google Voice calls to Grok AI's voice mode. Two Chromium instances are connected via virtual PulseAudio devices so callers can talk to Grok AI bidirectionally. Audio never plays through your physical speakers — it stays entirely between the two browser windows.
+A modular, multi-instance Ubuntu application that bridges incoming voice calls to AI voice mode. Multiple users can run independent instances, and each user can run multiple bridges with different voice providers and AI backends.
 
 ## What It Does
 
-1. **Monitors** `voice.google.com` for incoming phone calls
-2. **Filters** callers — only accepts calls from numbers you authorize
-3. **Auto-answers** authorized calls in Google Voice
-4. **Connects** the call audio to `grok.com` in voice/speak mode
-5. **Grok AI** speaks to the caller and hears their responses
-6. **Audio is virtual** — no sound comes out of your Ubuntu device's speakers
+1. **Monitors** a voice provider (e.g., Google Voice) for incoming calls
+2. **Filters** callers — only accepts authorized numbers/names
+3. **Auto-answers** authorized calls
+4. **Connects** call audio to an AI provider (e.g., Grok) in voice/speak mode
+5. **AI speaks** to the caller and hears responses bidirectionally
+6. **Audio is virtual** — routed through PulseAudio null-sinks, never through physical speakers
 
-## Architecture
+## Supported Providers
 
-```
-+──────────────+     PulseAudio Virtual     +──────────────+
-│   GV Browser │◄────src_grok_to_gv─────────│ Grok Browser │
-│voice.google  │                             │  grok.com    │
-│  (receives   │────pipe_gv_to_grok───────►│  (AI talks   │
-│   calls)     │    pipe_grok_to_gv        │   to caller) │
-+──────────────+                             +──────────────+
-```
+| Voice Providers | AI Providers |
+|-----------------|--------------|
+| Google Voice    | Grok         |
+| Twilio (stub)   | ChatGPT (stub) |
 
-Two PulseAudio null-sinks create virtual audio devices. Each Chromium browser is launched with `PULSE_SINK` and `PULSE_SOURCE` environment variables so their audio routes through the virtual devices instead of real hardware. Because Chromium's audio service runs as a separate process by default, we use `--disable-features=AudioServiceOutOfProcess` to force it in-process so the env vars are inherited. An automatic `fixStreamRouting()` monitor corrects any misrouted streams after voice mode activation.
+Adding a new provider requires implementing a single interface — see `docs/providers.md`.
 
 ## Requirements
 
@@ -32,159 +28,229 @@ Two PulseAudio null-sinks create virtual audio devices. Each Chromium browser is
 - Xvfb (for headless mode)
 - Pre-logged-in Chromium profile at `~/.config/chromium`
 
+## Installation
+
+### Option 1: From Source (Recommended for Development)
+
+```bash
+git clone https://github.com/clawbunny/gv-grok-bridge.git
+cd gv-grok-bridge
+sudo ./scripts/install.sh
+```
+
+### Option 2: From Release Tarball
+
+```bash
+tar -xzf voicebridge-2.0.0.tar.gz
+cd voicebridge-2.0.0
+sudo make install
+```
+
+### What the Installer Does
+
+- Installs system dependencies: PulseAudio, Xvfb, Chromium deps, Node.js 20
+- Installs npm dependencies and builds the TypeScript project
+- Copies the built project to `/opt/voicebridge`
+- Symlinks `voicebridge` and `voicebridge-run` into `/usr/local/bin`
+
+### Uninstall
+
+```bash
+sudo ./scripts/uninstall.sh
+```
+
+This stops all instances, removes the system installation, and optionally cleans up all user data.
+
+### Build a Release Tarball
+
+```bash
+make dist
+# → dist/voicebridge-<version>.tar.gz
+```
+
 ## Quick Start
 
-### 1. One-time Setup
+### 1. Log In (Critical!)
 
-```bash
-./setup.sh
-```
-
-This installs: PulseAudio, Xvfb, Node.js, Playwright Chromium.
-
-### 2. Log In (Critical!)
-
-You **must** be logged in to both services in your default Chromium profile:
+You must be logged in to your chosen services in your default Chromium profile:
 
 - Open your regular Chromium browser
-- Go to `https://voice.google.com` and log in with your Google account
-- Go to `https://grok.com` and log in with your x.ai account
+- Go to your voice provider (e.g., `https://voice.google.com`) and log in
+- Go to your AI provider (e.g., `https://grok.com`) and log in
 - **Close Chromium** (the bridge will use the same profile)
 
-### 3. Configure Authorized Numbers
+### 2. Create an Instance
 
 ```bash
-export GV_AUTHORIZED_NUMBERS="+12125551234,+13035556789"
-export GV_AUTHORIZED_NAMES="Alice,Bob"        # Optional: match caller name
-export GV_HEADLESS=true                         # Run with xvfb (default)
-export GV_AUTO_ACCEPT=true                      # Auto-answer authorized calls
+voicebridge setup
 ```
 
-### 4. Start the Bridge
+Or non-interactively:
 
 ```bash
-./start.sh
+voicebridge setup \
+  --instance-id martin-gv-grok-01 \
+  --voice-provider google-voice \
+  --ai-provider grok \
+  --numbers "+12125551234,+13035556789"
 ```
 
-Or with environment variables inline:
+### 3. Start the Instance
 
 ```bash
-GV_AUTHORIZED_NUMBERS="+12125551234" ./start.sh
+voicebridge start martin-gv-grok-01
 ```
 
-## Configuration (Environment Variables)
+Enable auto-start on boot:
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GV_AUTHORIZED_NUMBERS` | — | Comma-separated authorized phone numbers in E.164 format (`+1XXXXXXXXXX`) |
-| `GV_AUTHORIZED_NAMES` | — | Comma-separated substrings to match in caller name |
-| `GV_HEADLESS` | `true` | Run with Xvfb (no visible window) |
-| `GV_DISPLAY_NUM` | `:99` | Xvfb display number |
-| `GV_AUTO_ACCEPT` | `true` | Auto-answer authorized calls |
-| `GV_POLL_INTERVAL` | `1000` | DOM poll interval in ms for call detection |
-| `GV_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
-
-## How It Works (Detailed)
-
-### Audio Routing (PulseAudio)
-
-The bridge creates 4 virtual PulseAudio devices:
-
-| Device | Type | Role |
-|--------|------|------|
-| `pipe_gv_to_grok` | null-sink (`float32le`) | GV browser audio output |
-| `pipe_grok_to_gv` | null-sink (`float32le`) | Grok browser audio output |
-| `src_gv_to_grok` | remap-source | Feeds GV audio to Grok as microphone input |
-| `src_grok_to_gv` | remap-source | Feeds Grok audio to GV as microphone input |
-
-`float32le` format prevents integer clipping when WebRTC AGC pushes signal above 0 dBFS. Sinks are set to 70% volume on startup to create additional AGC headroom.
-
-### Browser Launch
-
-Two Chromium instances are launched via Playwright:
-
-- **GV browser**: `PULSE_SINK=pipe_gv_to_grok PULSE_SOURCE=src_grok_to_gv PULSE_PROP_application.name=Chromium-GV` → `voice.google.com`
-- **Grok browser**: `PULSE_SINK=pipe_grok_to_gv PULSE_SOURCE=src_gv_to_grok PULSE_PROP_application.name=Chromium-Grok` → `grok.com`
-
-Both browsers share the same login session from your default Chromium profile (Grok uses a copy with `dereference: true` to avoid symlink lock conflicts). Before each launch, any lingering Chromium processes are killed and `SingletonLock`/`SingletonCookie`/`SingletonSocket` files are stripped from both profiles.
-
-### Call Flow
-
-```
-IDLE → detects incoming call from authorized number
-  → auto-clicks "Answer" in Google Voice
-  → activates Grok voice/speak mode
-  → BRIDGED (caller ↔ Grok AI)
-  → detects call ended
-  → deactivates Grok voice mode
-  → IDLE
+```bash
+voicebridge enable martin-gv-grok-01
 ```
 
-Unauthorized calls are automatically declined.
+### 4. Manage Instances
+
+```bash
+# List all instances
+voicebridge list
+
+# View status
+voicebridge status martin-gv-grok-01
+
+# View logs
+voicebridge logs martin-gv-grok-01 -f
+
+# Stop
+voicebridge stop martin-gv-grok-01
+
+# Restart
+voicebridge restart martin-gv-grok-01
+
+# Edit config
+voicebridge config martin-gv-grok-01
+
+# Destroy (removes everything)
+voicebridge destroy martin-gv-grok-01
+```
+
+## Architecture
+
+Each **instance** is fully isolated:
+
+- Unique PulseAudio device namespace (`pipe_voice_to_ai_<instance>`, etc.)
+- Dedicated Xvfb display number
+- Separate Chromium profile copy
+- Per-instance systemd user service
+- Independent log file
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     CLI: voicebridge                        │
+│  setup | list | status | start | stop | restart | logs      │
+│  enable | disable | config | destroy                        │
+└─────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        ▼                     ▼                     ▼
+┌───────────────┐    ┌─────────────────┐    ┌─────────────┐
+│ Instance A    │    │ Instance B      │    │ Instance C  │
+│ (google-voice │    │ (twilio →       │    │ (google-    │
+│  → grok)      │    │  chatgpt)       │    │  voice →    │
+│               │    │                 │    │  chatgpt)   │
+└───────────────┘    └─────────────────┘    └─────────────┘
+```
+
+## Instance Configuration
+
+Instances are stored as YAML files in `~/.config/gv-bridge/instances/<id>.yaml`:
+
+```yaml
+instanceId: martin-gv-grok-01
+voiceProvider:
+  type: google-voice
+aiProvider:
+  type: grok
+authorizedNumbers:
+  - "+12125551234"
+authorizedNames:
+  - "Alice"
+headless: true
+displayNum: ":99"
+autoAccept: true
+pollInterval: 1000
+logLevel: info
+profilePath: /home/martin/.config/chromium
+```
 
 ## Project Structure
 
 ```
-project/
-├── src/
-│   ├── main.ts              # Entry point
-│   ├── config.ts            # Environment config loader
-│   ├── types.ts             # Shared TypeScript types
-│   ├── audio/
-│   │   └── pipeline.ts      # PulseAudio virtual device management
-│   ├── browser/
-│   │   └── manager.ts       # Dual Chromium Playwright launcher
+src/
+├── main.ts                    # Single-instance runtime entry
+├── types.ts                   # Shared TypeScript types
+├── logger.ts                  # Structured logging
+├── instance/
+│   ├── config.ts              # InstanceConfig schema
+│   ├── registry.ts            # Instance CRUD (YAML)
+│   ├── paths.ts               # Per-instance path utilities
+│   └── display-pool.ts        # Xvfb display allocator
+├── providers/
+│   ├── contracts.ts           # VoiceProvider + AIProvider interfaces
+│   ├── index.ts               # Provider factory
 │   ├── voice/
-│   │   └── monitor.ts       # Google Voice incoming call detector
-│   ├── grok/
-│   │   └── controller.ts    # Grok voice mode activation
-│   └── bridge/
-│       └── orchestrator.ts  # Main controller & state machine
-├── setup.sh                 # One-time Ubuntu setup
-├── start.sh                 # Start the bridge
-└── README.md                # This file
+│   │   ├── google-voice/      # Google Voice provider
+│   │   └── twilio/            # Twilio stub
+│   └── ai/
+│       ├── grok/              # Grok provider
+│       └── chatgpt/           # ChatGPT stub
+├── runtime/
+│   ├── audio/pipeline.ts      # Namespaced PulseAudio management
+│   ├── browser/manager.ts     # Dual Chromium launcher
+│   ├── monitor.ts             # Generic voice monitor
+│   ├── ai-controller.ts       # Generic AI controller
+│   ├── orchestrator.ts        # Main state machine
+│   └── xvfb.ts                # Xvfb lifecycle
+└── cli/
+    ├── main.ts                # CLI entry point
+    ├── commands/              # All CLI commands
+    └── systemd/template.ts    # Service file generator
+```
+
+## Multi-User Support
+
+Instances run as **systemd user services** (`systemctl --user`), so:
+
+- Each Linux user manages their own instances independently
+- No root required for setup, start, stop, or config changes
+- To auto-start before login, run: `loginctl enable-linger $USER`
+
+## Legacy Mode
+
+If you prefer the old single-instance env-var mode:
+
+```bash
+export GV_AUTHORIZED_NUMBERS="+12125551234"
+export GV_VOICE_PROVIDER="google-voice"
+export GV_AI_PROVIDER="grok"
+voicebridge-run
 ```
 
 ## Troubleshooting
 
-### "Google Voice not logged in"
-
-- Open Chromium normally, go to `voice.google.com`, log in, close the browser
+### Provider not logged in
+- Open Chromium normally, go to the provider URL, log in, close browser
 - The bridge uses your default profile at `~/.config/chromium`
 
-### "Grok not logged in"
-
-- Same process: open Chromium, go to `grok.com`, log in, close browser
-
 ### No audio in the bridge
-
-- Check PulseAudio: `pactl list sinks | grep pipe_` should show the null-sinks
+- Check PulseAudio: `pactl list sinks short | grep pipe_`
 - Check Xvfb is running: `ps aux | grep Xvfb`
 
 ### Call detection not working
-
-- Google Voice may change their DOM. Check the logs for selector attempts.
-- Increase log level: `GV_LOG_LEVEL=debug ./start.sh`
-
-### "Chromium profile lock" error
-
-- The bridge now automatically kills lingering Chromium processes and strips lock files before launch
-- If you still see this error, manually run: `pkill -9 -f 'chromium'` and restart the bridge
-
-### No audio / saturated audio
-
-- Check sink format is `float32le`: `pactl list sinks short | grep pipe_`
-- Check volume is at 70%: `pactl list sinks | grep Volume`
-- Check both sources are RUNNING during a call: `pactl list sources short`
-- Check source-outputs are on correct sources: `pactl list source-outputs short`
-  - GV browser should be on `src_grok_to_gv`
-  - Grok browser should be on `src_gv_to_grok`
-- The bridge auto-corrects routing within 2-8 seconds of answering; if not, check `bridge.log` for `Moved source-output` messages
+- Providers may change their DOM. Check logs for selector attempts.
+- Increase log level in instance config to `debug`
 
 ### PulseAudio module leaks
-
-- If you see many numbered duplicates (`pipe_gv_to_grok.2`, `.3`, etc.), restart the bridge
-- The bridge now cleans up stale modules automatically on startup
+- Each instance cleans up its own stale modules on startup
+- If you see duplicates, restart the instance: `voicebridge restart <id>`
 
 ## License
 

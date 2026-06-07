@@ -1,6 +1,10 @@
 #!/bin/bash
-# GV-Grok Bridge status banner
-# Install to /etc/update-motd.d/99-gv-grok-bridge
+# GV Bridge — MOTD status banner
+# Install to /etc/update-motd.d/99-voicebridge for login messages.
+#
+# Usage (as root):
+#   sudo cp motd.sh /etc/update-motd.d/99-voicebridge
+#   sudo chmod +x /etc/update-motd.d/99-voicebridge
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -10,57 +14,50 @@ NC='\033[0m'
 
 echo ""
 echo "=========================================="
-echo "     GV-Grok Bridge — Status & Help"
+echo "     GV Bridge — Instance Status"
 echo "=========================================="
 
-# Check bridge process
-BRIDGE_PID=$(pgrep -u gvgrok -f 'node dist/main.js' | head -1)
-if [ -n "$BRIDGE_PID" ]; then
-    echo -e "${GREEN}● Bridge is RUNNING${NC} (PID: $BRIDGE_PID)"
-else
-    echo -e "${RED}● Bridge is STOPPED${NC}"
+# Check for instances in all user home directories
+TOTAL_INSTANCES=0
+ACTIVE_INSTANCES=0
+INACTIVE_INSTANCES=0
+
+# Collect instance info from all users with systemd user services
+for user_dir in /home/*; do
+  if [ ! -d "$user_dir/.config/systemd/user" ]; then
+    continue
+  fi
+  user=$(basename "$user_dir")
+  for svc in "$user_dir/.config/systemd/user"/gv-bridge-*.service; do
+    [ -f "$svc" ] || continue
+    instance=$(basename "$svc" .service | sed 's/gv-bridge-//')
+    TOTAL_INSTANCES=$((TOTAL_INSTANCES + 1))
+    status=$(su - "$user" -c "systemctl --user is-active gv-bridge-${instance} 2>/dev/null" || echo "inactive")
+    if [ "$status" = "active" ]; then
+      ACTIVE_INSTANCES=$((ACTIVE_INSTANCES + 1))
+      echo -e "  ${GREEN}●${NC} ${instance} (user: ${user})"
+    else
+      INACTIVE_INSTANCES=$((INACTIVE_INSTANCES + 1))
+      echo -e "  ${RED}●${NC} ${instance} (user: ${user}) — stopped"
+    fi
+  done
+done
+
+if [ "$TOTAL_INSTANCES" -eq 0 ]; then
+  echo "  No instances configured."
+  echo ""
+  echo "  To get started:"
+  echo "    voicebridge setup"
 fi
 
-# Check Chromium processes
-CHROME_COUNT=$(pgrep -u gvgrok -c -f 'chromium' 2>/dev/null || echo 0)
-if [ "$CHROME_COUNT" -gt 0 ]; then
-    echo -e "${GREEN}  Chromium processes: $CHROME_COUNT${NC}"
-else
-    echo -e "${YELLOW}  No Chromium processes${NC}"
-fi
-
-# Check PulseAudio devices
-echo ""
-echo "PulseAudio virtual devices:"
-if command -v pactl >/dev/null 2>&1; then
-    sudo -u gvgrok pactl list sinks short 2>/dev/null | grep -E 'pipe_gv_to_grok|pipe_grok_to_gv' | while read line; do
-        echo "  $line"
-    done
-else
-    echo "  (PulseAudio not available)"
-fi
-
-# Recent log tail
-echo ""
-echo "Recent log entries:"
-if [ -f /home/gvgrok/project/bridge.log ]; then
-    tail -n 4 /home/gvgrok/project/bridge.log 2>/dev/null | sed 's/^/  /'
-else
-    echo "  (No log file found)"
-fi
-
-# Quick commands
 echo ""
 echo "Quick commands:"
-echo "  Start bridge:      sudo systemctl start gv-grok-bridge"
-echo "  Stop bridge:       sudo systemctl stop gv-grok-bridge"
-echo "  View logs:         sudo tail -f /home/gvgrok/project/bridge.log"
-echo "  Restart bridge:    sudo systemctl restart gv-grok-bridge"
-echo "  Check status:      sudo systemctl status gv-grok-bridge"
-echo "  Check audio:       sudo -u gvgrok pactl list sources short"
-echo "  VNC desktop:       ssh -L 5903:localhost:5903 $(whoami)@$(hostname -f)"
-echo "                     VNC password: <VNC_PASSWORD>"
-
+echo "  List instances:    voicebridge list"
+echo "  Start instance:    voicebridge start <id>"
+echo "  Stop instance:     voicebridge stop <id>"
+echo "  View logs:         voicebridge logs <id> -f"
+echo "  Check status:      voicebridge status <id>"
+echo "  Create instance:   voicebridge setup"
 echo ""
 echo "=========================================="
 echo ""
