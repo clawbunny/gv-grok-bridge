@@ -32,7 +32,7 @@ export class AudioPipeline {
     return this.exec(cmd);
   }
 
-  private get deviceNames() {
+  get deviceNames() {
     const ns = this.namespace;
     return {
       voiceSink: `pipe_voice_to_ai_${ns}`,
@@ -40,6 +40,11 @@ export class AudioPipeline {
       voiceSource: `src_voice_to_ai_${ns}`,
       aiSource: `src_ai_to_voice_${ns}`,
     };
+  }
+
+  async setDefaultSource(sourceName: string): Promise<void> {
+    await this.execPromise(`pactl set-default-source ${sourceName}`);
+    this.logger.debug(`Set default PulseAudio source to ${sourceName}`);
   }
 
   private getModules(): ModuleDef[] {

@@ -155,6 +155,13 @@ export class BridgeOrchestrator {
 
   private async onIncomingCall(call: CallInfo): Promise<void> {
     this.logger.info(`Incoming call from ${call.callerName} (${call.phoneNumber})`);
+    try {
+      const d = this.audioPipeline.deviceNames;
+      await this.audioPipeline.setDefaultSource(d.aiSource);
+      this.logger.info(`Set default source to ${d.aiSource} for voice browser`);
+    } catch (err) {
+      this.logger.warn('Failed to set default source for incoming call', { error: (err as Error).message });
+    }
   }
 
   private async onCallAccepted(call: CallInfo): Promise<void> {
@@ -165,6 +172,16 @@ export class BridgeOrchestrator {
     try {
       const pair = this.browserManager.getPair();
       if (!pair) throw new Error('Browser pair not available');
+
+      // Set default source for AI browser before activating voice mode
+      try {
+        const d = this.audioPipeline.deviceNames;
+        await this.audioPipeline.setDefaultSource(d.voiceSource);
+        this.logger.info(`Set default source to ${d.voiceSource} for AI browser`);
+      } catch (err) {
+        this.logger.warn('Failed to set default source for AI browser', { error: (err as Error).message });
+      }
+
       const activated = await this.aiController.activateVoiceMode(pair.aiPage);
       this.status.voiceModeActive = activated;
 
@@ -194,6 +211,14 @@ export class BridgeOrchestrator {
     this.logger.info('Call ended, deactivating AI voice mode...');
     this.status.inCall = false;
     this.status.currentCall = undefined;
+
+    try {
+      const d = this.audioPipeline.deviceNames;
+      await this.audioPipeline.setDefaultSource(`${d.voiceSink}.monitor`);
+      this.logger.info(`Restored default source to ${d.voiceSink}.monitor`);
+    } catch (err) {
+      this.logger.warn('Failed to restore default source', { error: (err as Error).message });
+    }
 
     try {
       const pair = this.browserManager.getPair();
