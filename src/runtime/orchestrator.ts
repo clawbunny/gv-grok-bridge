@@ -155,6 +155,15 @@ export class BridgeOrchestrator {
 
   private async onIncomingCall(call: CallInfo): Promise<void> {
     this.logger.info(`Incoming call from ${call.callerName} (${call.phoneNumber})`);
+    try {
+      const d = this.audioPipeline.deviceNames;
+      await this.audioPipeline.setDefaultSource(d.aiSource);
+      this.logger.info(`Set default source to ${d.aiSource} for voice browser`);
+      await this.audioPipeline.setDefaultSink(d.voiceSink);
+      this.logger.info(`Set default sink to ${d.voiceSink} for voice browser`);
+    } catch (err) {
+      this.logger.warn('Failed to set default audio for incoming call', { error: (err as Error).message });
+    }
   }
 
   private async onCallAccepted(call: CallInfo): Promise<void> {
@@ -165,8 +174,42 @@ export class BridgeOrchestrator {
     try {
       const pair = this.browserManager.getPair();
       if (!pair) throw new Error('Browser pair not available');
+
+      // Capture screenshot of voice page after answering
+      const screenshotDir = '/tmp/gv-bridge-screenshots';
+      try {
+        const fs = await import('fs');
+        if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        await pair.voicePage.screenshot({ path: `${screenshotDir}/voice-${ts}-answered.png`, fullPage: false });
+        this.logger.info(`Screenshot saved: voice-${ts}-answered.png`);
+      } catch (ssErr) {
+        this.logger.debug('Voice screenshot failed', { error: (ssErr as Error).message });
+      }
+
+      // Set default audio for AI browser before activating voice mode
+      try {
+        const d = this.audioPipeline.deviceNames;
+        await this.audioPipeline.setDefaultSource(d.voiceSource);
+        this.logger.info(`Set default source to ${d.voiceSource} for AI browser`);
+        await this.audioPipeline.setDefaultSink(d.aiSink);
+        this.logger.info(`Set default sink to ${d.aiSink} for AI browser`);
+      } catch (err) {
+        this.logger.warn('Failed to set default audio for AI browser', { error: (err as Error).message });
+      }
+
       const activated = await this.aiController.activateVoiceMode(pair.aiPage);
       this.status.voiceModeActive = activated;
+
+      // Capture screenshot of AI page after voice mode activation
+      try {
+        const fs = await import('fs');
+        const ts = new Date().toISOString().replace(/[:.]/g, '-');
+        await pair.aiPage.screenshot({ path: `${screenshotDir}/ai-${ts}-voice-activated.png`, fullPage: false });
+        this.logger.info(`Screenshot saved: ai-${ts}-voice-activated.png`);
+      } catch (ssErr) {
+        this.logger.debug('AI screenshot failed', { error: (ssErr as Error).message });
+      }
 
       setTimeout(() => {
         this.audioPipeline.fixStreamRouting(
@@ -174,6 +217,12 @@ export class BridgeOrchestrator {
           this.config.tempProfilePath,
         ).catch((err) =>
           this.logger.error('Audio routing fix failed', { error: (err as Error).message }),
+        );
+        this.audioPipeline.fixSinkRouting(
+          this.config.defaultProfilePath,
+          this.config.tempProfilePath,
+        ).catch((err) =>
+          this.logger.error('Audio sink routing fix failed', { error: (err as Error).message }),
         );
       }, 2000).unref();
 
@@ -183,6 +232,12 @@ export class BridgeOrchestrator {
           this.config.tempProfilePath,
         ).catch((err) =>
           this.logger.error('Audio routing fix failed', { error: (err as Error).message }),
+        );
+        this.audioPipeline.fixSinkRouting(
+          this.config.defaultProfilePath,
+          this.config.tempProfilePath,
+        ).catch((err) =>
+          this.logger.error('Audio sink routing fix failed', { error: (err as Error).message }),
         );
       }, 8000).unref();
     } catch (err) {
@@ -194,6 +249,16 @@ export class BridgeOrchestrator {
     this.logger.info('Call ended, deactivating AI voice mode...');
     this.status.inCall = false;
     this.status.currentCall = undefined;
+
+    try {
+      const d = this.audioPipeline.deviceNames;
+      await this.audioPipeline.setDefaultSource(`${d.voiceSink}.monitor`);
+      this.logger.info(`Restored default source to ${d.voiceSink}.monitor`);
+      await this.audioPipeline.setDefaultSink(d.voiceSink);
+      this.logger.info(`Restored default sink to ${d.voiceSink}`);
+    } catch (err) {
+      this.logger.warn('Failed to restore default audio', { error: (err as Error).message });
+    }
 
     try {
       const pair = this.browserManager.getPair();
@@ -220,6 +285,10 @@ export class BridgeOrchestrator {
 
         if (this.status.inCall) {
           await this.audioPipeline.fixStreamRouting(
+            this.config.defaultProfilePath,
+            this.config.tempProfilePath,
+          );
+          await this.audioPipeline.fixSinkRouting(
             this.config.defaultProfilePath,
             this.config.tempProfilePath,
           );

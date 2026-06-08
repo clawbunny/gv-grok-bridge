@@ -32,7 +32,7 @@ export class AudioPipeline {
     return this.exec(cmd);
   }
 
-  private get deviceNames() {
+  get deviceNames() {
     const ns = this.namespace;
     return {
       voiceSink: `pipe_voice_to_ai_${ns}`,
@@ -40,6 +40,16 @@ export class AudioPipeline {
       voiceSource: `src_voice_to_ai_${ns}`,
       aiSource: `src_ai_to_voice_${ns}`,
     };
+  }
+
+  async setDefaultSource(sourceName: string): Promise<void> {
+    await this.execPromise(`pactl set-default-source ${sourceName}`);
+    this.logger.debug(`Set default PulseAudio source to ${sourceName}`);
+  }
+
+  async setDefaultSink(sinkName: string): Promise<void> {
+    await this.execPromise(`pactl set-default-sink ${sinkName}`);
+    this.logger.debug(`Set default PulseAudio sink to ${sinkName}`);
   }
 
   private getModules(): ModuleDef[] {
@@ -212,6 +222,22 @@ export class AudioPipeline {
     return null;
   }
 
+  private async findSinkId(name: string): Promise<number | null> {
+    try {
+      const { stdout } = await this.execPromise('pactl list sinks short');
+      for (const line of stdout.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2 && parts[1] === name) {
+          const id = parseInt(parts[0], 10);
+          return Number.isNaN(id) ? null : id;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
   async fixStreamRouting(voiceUserDataDir: string, aiUserDataDir: string): Promise<void> {
     const d = this.deviceNames;
     const voicePid = await this.findChromiumPid(voiceUserDataDir);
@@ -268,6 +294,67 @@ export class AudioPipeline {
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.logger.warn(`Failed to move source-output ${sourceOutputId}: ${message}`);
+        }
+      }
+    }
+  }
+
+  async fixSinkRouting(voiceUserDataDir: string, aiUserDataDir: string): Promise<void> {
+    const d = this.deviceNames;
+    const voicePid = await this.findChromiumPid(voiceUserDataDir);
+    const aiPid = await this.findChromiumPid(aiUserDataDir);
+    const sinkVoice = await this.findSinkId(d.voiceSink);
+    const sinkAi = await this.findSinkId(d.aiSink);
+
+    if (!voicePid || !aiPid || !sinkVoice || !sinkAi) {
+      this.logger.warn('Could not find Chromium PIDs or sink IDs for sink routing');
+      return;
+    }
+
+    this.logger.debug(`Routing sinks: voicePid=${voicePid}, aiPid=${aiPid}, sinkVoice=${sinkVoice}, sinkAi=${sinkAi}`);
+
+    let stdout: string;
+    try {
+      ({ stdout } = await this.execPromise('pactl list sink-inputs short'));
+    } catch {
+      return;
+    }
+
+    for (const line of stdout.split('\n')) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 5) continue;
+
+      const sinkInputId = parseInt(parts[0], 10);
+      const currentSink = parseInt(parts[1], 10);
+      const clientId = parts[2];
+      if (clientId === '-') continue;
+      if (Number.isNaN(sinkInputId)) continue;
+
+      let detail: string;
+      try {
+        ({ stdout: detail } = await this.execPromise(`pactl list sink-inputs | grep -A 25 'Sink Input #${sinkInputId}'`));
+      } catch {
+        continue;
+      }
+
+      const pidMatch = detail.match(/application\.process\.id\s*=\s*"(\d+)"/);
+      if (!pidMatch) continue;
+      const streamPid = parseInt(pidMatch[1], 10);
+
+      let targetSink: number | null = null;
+      if (streamPid === voicePid && currentSink !== sinkVoice) {
+        targetSink = sinkVoice;
+      } else if (streamPid === aiPid && currentSink !== sinkAi) {
+        targetSink = sinkAi;
+      }
+
+      if (targetSink !== null) {
+        try {
+          await this.execPromise(`pactl move-sink-input ${sinkInputId} ${targetSink}`);
+          this.logger.info(`Moved sink-input ${sinkInputId} (PID ${streamPid}) to sink ${targetSink}`);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          this.logger.warn(`Failed to move sink-input ${sinkInputId}: ${message}`);
         }
       }
     }

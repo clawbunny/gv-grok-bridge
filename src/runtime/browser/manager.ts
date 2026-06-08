@@ -151,6 +151,21 @@ export class BrowserManager {
     const page = await ctx.newPage();
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     this.logger.debug(`${label} navigated to ${url}`);
+
+    // Capture console logs for debugging
+    page.on('console', (msg) => {
+      const type = msg.type();
+      const text = msg.text();
+      if (type === 'error') {
+        this.logger.debug(`[${label} console.error] ${text}`);
+      } else if (type === 'warning') {
+        this.logger.debug(`[${label} console.warn] ${text}`);
+      }
+    });
+    page.on('pageerror', (err) => {
+      this.logger.debug(`[${label} pageerror] ${err.message}`);
+    });
+
     return page;
   }
 
