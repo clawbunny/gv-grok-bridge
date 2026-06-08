@@ -175,18 +175,6 @@ export class BridgeOrchestrator {
       const pair = this.browserManager.getPair();
       if (!pair) throw new Error('Browser pair not available');
 
-      // Capture screenshot of voice page after answering
-      const screenshotDir = '/tmp/gv-bridge-screenshots';
-      try {
-        const fs = await import('fs');
-        if (!fs.existsSync(screenshotDir)) fs.mkdirSync(screenshotDir, { recursive: true });
-        const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        await pair.voicePage.screenshot({ path: `${screenshotDir}/voice-${ts}-answered.png`, fullPage: false });
-        this.logger.info(`Screenshot saved: voice-${ts}-answered.png`);
-      } catch (ssErr) {
-        this.logger.debug('Voice screenshot failed', { error: (ssErr as Error).message });
-      }
-
       // Set default audio for AI browser before activating voice mode
       try {
         const d = this.audioPipeline.deviceNames;
@@ -200,16 +188,6 @@ export class BridgeOrchestrator {
 
       const activated = await this.aiController.activateVoiceMode(pair.aiPage);
       this.status.voiceModeActive = activated;
-
-      // Capture screenshot of AI page after voice mode activation
-      try {
-        const fs = await import('fs');
-        const ts = new Date().toISOString().replace(/[:.]/g, '-');
-        await pair.aiPage.screenshot({ path: `${screenshotDir}/ai-${ts}-voice-activated.png`, fullPage: false });
-        this.logger.info(`Screenshot saved: ai-${ts}-voice-activated.png`);
-      } catch (ssErr) {
-        this.logger.debug('AI screenshot failed', { error: (ssErr as Error).message });
-      }
 
       setTimeout(() => {
         this.audioPipeline.fixStreamRouting(

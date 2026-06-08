@@ -107,18 +107,10 @@ export class GrokProvider implements AIProvider {
       await this.dismissCookieConsent(page, logger);
       await this.dismissModals(page, logger);
 
-      // Log current URL and visible buttons for debugging
-      logger.debug(`Grok page URL: ${page.url()}`);
-      const micButtons = await page.locator('button[aria-label*="microphone" i], button[aria-label*="voice" i]').count();
-      logger.debug(`Found ${micButtons} mic/voice buttons on Grok page`);
-
       const micLocator = page.locator('button[aria-label*="microphone" i], button[aria-label*="voice" i]').first();
       if ((await micLocator.count()) > 0) {
-        const ariaLabel = await micLocator.getAttribute('aria-label').catch(() => 'unknown');
-        logger.debug(`Mic button aria-label: ${ariaLabel}`);
         try {
           await micLocator.click({ force: true, timeout: 5000 });
-          await page.waitForTimeout(1000);
           this.voiceModeActive = true;
           logger.info('Grok voice mode activated (force click)');
           return true;
