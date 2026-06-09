@@ -73,7 +73,50 @@ export class TextNowVoiceProvider implements VoiceProvider {
   async acceptCall(page: Page, logger: Logger): Promise<void> {
     logger.info('Trying to accept call');
 
+    // Try JavaScript direct click first — most reliable for TextNow's div-based buttons
+    try {
+      const clicked = await page.evaluate(() => {
+        const dialog = document.querySelector('.new-dialog-container.incoming-call');
+        if (!dialog) return false;
+        // Try explicit accept button classes
+        let btn = dialog.querySelector('.button.accept.primary') as HTMLElement | null;
+        if (!btn) btn = dialog.querySelector('.button.accept') as HTMLElement | null;
+        // Try any image with alt="Accept" and walk up to clickable parent
+        if (!btn) {
+          const img = dialog.querySelector('img[alt="Accept"]') as HTMLElement | null;
+          if (img) {
+            let el: HTMLElement | null = img;
+            while (el && el !== dialog) {
+              if (el.classList.contains('button') || el.tagName === 'BUTTON') {
+                btn = el;
+                break;
+              }
+              el = el.parentElement as HTMLElement | null;
+            }
+          }
+        }
+        if (btn) {
+          // Use dispatchEvent with a proper MouseEvent to trigger React synthetic handlers
+          const event = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+          btn.dispatchEvent(event);
+          // Also fire the native click as a fallback
+          btn.click();
+          return true;
+        }
+        return false;
+      });
+      if (clicked) {
+        logger.info('Clicked answer button via JavaScript');
+        return;
+      }
+    } catch (err) {
+      logger.warn('JavaScript accept click failed', { error: (err as Error).message });
+    }
+
+    // Fallback to Playwright locators
     const primarySelectors = [
+      '.new-dialog-container.incoming-call .button.accept',
+      '.button.accept.primary',
       'button[aria-label="Answer call"]',
       'button[aria-label="Answer"]',
       '[data-testid="answer-button"]',
@@ -82,7 +125,7 @@ export class TextNowVoiceProvider implements VoiceProvider {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click();
+          await locator.click({ timeout: 5000 });
           logger.info('Clicked answer button (primary selector)');
           return;
         }
@@ -92,17 +135,18 @@ export class TextNowVoiceProvider implements VoiceProvider {
     }
 
     const fallbackSelectors = [
-      'button:has-text("Answer")',
-      'button[aria-label*="Answer" i]',
       'button:has-text("Accept")',
       'button[aria-label*="Accept" i]',
+      'button:has-text("Answer")',
+      'button[aria-label*="Answer" i]',
+      'div[role="button"]:has-text("Accept")',
       'div[role="button"]:has-text("Answer")',
     ];
     for (const selector of fallbackSelectors) {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click();
+          await locator.click({ timeout: 5000 });
           logger.info('Clicked answer button (fallback selector)');
           return;
         }
@@ -116,7 +160,46 @@ export class TextNowVoiceProvider implements VoiceProvider {
   async declineCall(page: Page, logger: Logger): Promise<void> {
     logger.info('Trying to decline call');
 
+    // Try JavaScript direct click first
+    try {
+      const clicked = await page.evaluate(() => {
+        const dialog = document.querySelector('.new-dialog-container.incoming-call');
+        if (!dialog) return false;
+        let btn = dialog.querySelector('#no-btn') as HTMLElement | null;
+        if (!btn) btn = dialog.querySelector('.button.decline.secondary') as HTMLElement | null;
+        if (!btn) btn = dialog.querySelector('.button.decline') as HTMLElement | null;
+        if (!btn) {
+          const img = dialog.querySelector('img[alt="Decline"]') as HTMLElement | null;
+          if (img) {
+            let el: HTMLElement | null = img;
+            while (el && el !== dialog) {
+              if (el.classList.contains('button') || el.tagName === 'BUTTON') {
+                btn = el;
+                break;
+              }
+              el = el.parentElement as HTMLElement | null;
+            }
+          }
+        }
+        if (btn) {
+          const event = new MouseEvent('click', { bubbles: true, cancelable: true, view: window });
+          btn.dispatchEvent(event);
+          btn.click();
+          return true;
+        }
+        return false;
+      });
+      if (clicked) {
+        logger.info('Clicked decline button via JavaScript');
+        return;
+      }
+    } catch (err) {
+      logger.warn('JavaScript decline click failed', { error: (err as Error).message });
+    }
+
     const primarySelectors = [
+      '#no-btn',
+      '.button.decline.secondary',
       'button[aria-label="Hang up call"]',
       'button[aria-label="End call"]',
       'button[aria-label="Decline"]',
@@ -127,7 +210,7 @@ export class TextNowVoiceProvider implements VoiceProvider {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click();
+          await locator.click({ timeout: 5000 });
           logger.info('Clicked decline button (primary selector)');
           return;
         }
@@ -149,7 +232,7 @@ export class TextNowVoiceProvider implements VoiceProvider {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click();
+          await locator.click({ timeout: 5000 });
           logger.info('Clicked decline button (fallback selector)');
           return;
         }
@@ -162,6 +245,13 @@ export class TextNowVoiceProvider implements VoiceProvider {
 
   async isCallActive(page: Page, _logger: Logger): Promise<boolean> {
     try {
+      // The incoming-call dialog is only present during an active/ringing call.
+      // Once the call ends or goes to voicemail, it disappears.
+      const hasIncomingDialog = (await page.locator('.new-dialog-container.incoming-call').count()) > 0;
+      if (hasIncomingDialog) return true;
+
+      // Check for active in-call UI elements that indicate an ongoing conversation.
+      // These selectors must be specific to active calls, not permanent page elements.
       const hasActiveWrapper = (await page.locator('[class*="active-call"]').count()) > 0;
       const hasInCall = (await page.locator('[class*="in-call"]').count()) > 0;
       const hasCallPanel = (await page.locator('[class*="call-panel"]').count()) > 0;
@@ -205,11 +295,13 @@ export class TextNowVoiceProvider implements VoiceProvider {
 
   private async isCallUIVisible(page: Page): Promise<boolean> {
     try {
+      if ((await page.locator('.new-dialog-container.incoming-call').count()) > 0) return true;
       if ((await page.locator('[class*="active-call"]').count()) > 0) return true;
       if ((await page.locator('[class*="incoming-call"]').count()) > 0) return true;
       if ((await page.locator('[class*="call-panel"]').count()) > 0) return true;
       if ((await page.locator('button[aria-label*="Answer"]').count()) > 0) return true;
       if ((await page.locator('button:has-text("Answer")').count()) > 0) return true;
+      if ((await page.locator('button:has-text("Accept")').count()) > 0) return true;
       return false;
     } catch {
       return false;
@@ -218,7 +310,27 @@ export class TextNowVoiceProvider implements VoiceProvider {
 
   private async extractCallerInfo(page: Page, logger: Logger): Promise<CallInfo | null> {
     const result = await page.evaluate(() => {
-      // Try active call wrapper first
+      // If the TextNow incoming call dialog is present, we know there's a call.
+      // Search the entire page for a phone number.
+      const incomingDialog = document.querySelector('.new-dialog-container.incoming-call');
+      if (incomingDialog) {
+        const bodyText = document.body.innerText || '';
+        const patterns = [
+          /\+1\s*\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}/,
+          /\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}/,
+          /\b\d{10}\b/,
+        ];
+        for (const pattern of patterns) {
+          const match = bodyText.match(pattern);
+          if (match) {
+            return { rawNumber: match[0], callerName: '', source: 'page-body' };
+          }
+        }
+        // No number found on page, but dialog is present — still a call
+        return { rawNumber: '', callerName: '', source: 'incoming-dialog' };
+      }
+
+      // Try active call wrapper
       const activeWrapper = document.querySelector('[class*="active-call"]');
       if (activeWrapper) {
         const text = (activeWrapper as HTMLElement).innerText || '';
@@ -234,11 +346,12 @@ export class TextNowVoiceProvider implements VoiceProvider {
         }
       }
 
-      // Try incoming call popup/container
+      // Try incoming call popup/container via text walker
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
       let node;
       while ((node = walker.nextNode()) !== null) {
-        if ((node.textContent || '').includes('Incoming call')) {
+        const textContent = (node.textContent || '').toLowerCase();
+        if (textContent.includes('incoming call')) {
           let el: any = node.parentElement;
           for (let i = 0; i < 6 && el; i++) {
             el = el.parentElement;
@@ -259,9 +372,12 @@ export class TextNowVoiceProvider implements VoiceProvider {
         }
       }
 
-      // Try any element containing a phone number near answer/decline buttons
-      const buttons = Array.from(document.querySelectorAll('button'));
-      const hasAnswer = buttons.some((b) => (b.innerText || b.getAttribute('aria-label') || '').toLowerCase().includes('answer'));
+      // Try any element containing a phone number near answer/decline/accept buttons
+      const buttons = Array.from(document.querySelectorAll('button, [role="button"], .button.accept, .button.decline'));
+      const hasAnswer = buttons.some((b) => {
+        const label = ((b as HTMLElement).innerText || b.getAttribute('aria-label') || '').toLowerCase();
+        return label.includes('answer') || label.includes('accept') || label.includes('decline');
+      });
       if (hasAnswer) {
         const bodyText = document.body.innerText;
         const patterns = [
