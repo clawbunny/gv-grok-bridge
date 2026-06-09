@@ -1,11 +1,12 @@
 /**
- * Google Voice Provider — implements VoiceProvider for voice.google.com
+ * TextNow Voice Provider — implements VoiceProvider for www.textnow.com
  */
 
 import type { Page, BrowserContext } from 'playwright';
 import type { Logger } from '../../../logger';
 import type { CallInfo } from '../../../types';
 import type { VoiceProvider } from '../../contracts';
+import { normalizePhoneNumber } from '../google-voice/provider';
 import * as fs from 'fs';
 
 interface CookieEntry {
@@ -19,11 +20,11 @@ interface CookieEntry {
   sameSite?: number | string;
 }
 
-export class GoogleVoiceProvider implements VoiceProvider {
-  readonly id = 'google-voice';
-  readonly name = 'Google Voice';
-  readonly url = 'https://voice.google.com';
-  readonly origin = 'https://voice.google.com';
+export class TextNowVoiceProvider implements VoiceProvider {
+  readonly id = 'textnow';
+  readonly name = 'TextNow';
+  readonly url = 'https://www.textnow.com/messaging';
+  readonly origin = 'https://www.textnow.com';
 
   constructor(private cookiePath?: string) {}
 
@@ -32,7 +33,7 @@ export class GoogleVoiceProvider implements VoiceProvider {
 
     try {
       await context.grantPermissions(['microphone'], { origin: this.origin });
-      logger.debug('Microphone permission granted for Google Voice');
+      logger.debug('Microphone permission granted for TextNow');
     } catch (err) {
       logger.warn('Failed to grant microphone permissions', { error: (err as Error).message });
     }
@@ -45,15 +46,21 @@ export class GoogleVoiceProvider implements VoiceProvider {
       }
     }
 
+    try {
+      await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    } catch (err) {
+      logger.warn('Navigation to TextNow messaging timed out or failed', { error: (err as Error).message });
+    }
+
     const isLoggedIn = await this.checkLoggedIn(page, logger);
-    logger.info(`Google Voice initialization complete. Logged in: ${isLoggedIn}`);
+    logger.info(`TextNow initialization complete. Logged in: ${isLoggedIn}`);
     return isLoggedIn;
   }
 
   async checkLoggedIn(page: Page, logger: Logger): Promise<boolean> {
     const url = page.url();
-    const loggedIn = url.includes('voice.google.com') && !url.includes('accounts.google.com');
-    logger.debug(`Google Voice login check: ${loggedIn} (url: ${url})`);
+    const loggedIn = url.includes('textnow.com') && !url.includes('/login') && !url.includes('/signin');
+    logger.debug(`TextNow login check: ${loggedIn} (url: ${url})`);
     return loggedIn;
   }
 
@@ -67,8 +74,9 @@ export class GoogleVoiceProvider implements VoiceProvider {
     logger.info('Trying to accept call');
 
     const primarySelectors = [
-      '[gv-test-id="in-call-pickup-call"]',
       'button[aria-label="Answer call"]',
+      'button[aria-label="Answer"]',
+      '[data-testid="answer-button"]',
     ];
     for (const selector of primarySelectors) {
       try {
@@ -106,9 +114,14 @@ export class GoogleVoiceProvider implements VoiceProvider {
   }
 
   async declineCall(page: Page, logger: Logger): Promise<void> {
+    logger.info('Trying to decline call');
+
     const primarySelectors = [
-      '[gv-test-id="in-call-end-call"]',
       'button[aria-label="Hang up call"]',
+      'button[aria-label="End call"]',
+      'button[aria-label="Decline"]',
+      '[data-testid="decline-button"]',
+      '[data-testid="end-call-button"]',
     ];
     for (const selector of primarySelectors) {
       try {
@@ -128,6 +141,8 @@ export class GoogleVoiceProvider implements VoiceProvider {
       'button[aria-label*="Decline" i]',
       'button:has-text("Reject")',
       'button[aria-label*="Reject" i]',
+      'button:has-text("End call")',
+      'button[aria-label*="End call" i]',
       'div[role="button"]:has-text("Decline")',
     ];
     for (const selector of fallbackSelectors) {
@@ -147,10 +162,10 @@ export class GoogleVoiceProvider implements VoiceProvider {
 
   async isCallActive(page: Page, _logger: Logger): Promise<boolean> {
     try {
-      const hasActiveWrapper = (await page.locator('[class*="active-call-wrapper"]').count()) > 0;
-      const hasPickupBtn = (await page.locator('[gv-test-id="in-call-pickup-call"]').count()) > 0;
-      const hasEndBtn = (await page.locator('[gv-test-id="in-call-end-call"]').count()) > 0;
-      return hasActiveWrapper || hasPickupBtn || hasEndBtn;
+      const hasActiveWrapper = (await page.locator('[class*="active-call"]').count()) > 0;
+      const hasInCall = (await page.locator('[class*="in-call"]').count()) > 0;
+      const hasCallPanel = (await page.locator('[class*="call-panel"]').count()) > 0;
+      return hasActiveWrapper || hasInCall || hasCallPanel;
     } catch {
       return false;
     }
@@ -190,10 +205,11 @@ export class GoogleVoiceProvider implements VoiceProvider {
 
   private async isCallUIVisible(page: Page): Promise<boolean> {
     try {
-      if ((await page.locator('[class*="active-call-wrapper"]').count()) > 0) return true;
-      if ((await page.locator('div[gv-test-id="incoming-call"]').count()) > 0) return true;
-      if ((await page.locator('[gv-test-id="in-call-pickup-call"]').count()) > 0) return true;
-      if ((await page.locator('[gv-test-id="in-call-end-call"]').count()) > 0) return true;
+      if ((await page.locator('[class*="active-call"]').count()) > 0) return true;
+      if ((await page.locator('[class*="incoming-call"]').count()) > 0) return true;
+      if ((await page.locator('[class*="call-panel"]').count()) > 0) return true;
+      if ((await page.locator('button[aria-label*="Answer"]').count()) > 0) return true;
+      if ((await page.locator('button:has-text("Answer")').count()) > 0) return true;
       return false;
     } catch {
       return false;
@@ -202,7 +218,8 @@ export class GoogleVoiceProvider implements VoiceProvider {
 
   private async extractCallerInfo(page: Page, logger: Logger): Promise<CallInfo | null> {
     const result = await page.evaluate(() => {
-      const activeWrapper = document.querySelector('[class*="active-call-wrapper"]');
+      // Try active call wrapper first
+      const activeWrapper = document.querySelector('[class*="active-call"]');
       if (activeWrapper) {
         const text = (activeWrapper as HTMLElement).innerText || '';
         const patterns = [
@@ -212,11 +229,12 @@ export class GoogleVoiceProvider implements VoiceProvider {
         for (const pattern of patterns) {
           const match = text.match(pattern);
           if (match) {
-            return { rawNumber: match[0], callerName: '', source: 'active-wrapper' };
+            return { rawNumber: match[0], callerName: '', source: 'active-call' };
           }
         }
       }
 
+      // Try incoming call popup/container
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
       let node;
       while ((node = walker.nextNode()) !== null) {
@@ -241,16 +259,20 @@ export class GoogleVoiceProvider implements VoiceProvider {
         }
       }
 
-      const incomingCallEl = document.querySelector('div[gv-test-id="incoming-call"]');
-      if (incomingCallEl) {
-        const text = (incomingCallEl as HTMLElement).innerText || '';
+      // Try any element containing a phone number near answer/decline buttons
+      const buttons = Array.from(document.querySelectorAll('button'));
+      const hasAnswer = buttons.some((b) => (b.innerText || b.getAttribute('aria-label') || '').toLowerCase().includes('answer'));
+      if (hasAnswer) {
+        const bodyText = document.body.innerText;
         const patterns = [
           /\+1\s*\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}/,
           /\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}/,
         ];
         for (const pattern of patterns) {
-          const match = text.match(pattern);
-          if (match) return { rawNumber: match[0], callerName: '', source: 'incoming-call-el' };
+          const match = bodyText.match(pattern);
+          if (match) {
+            return { rawNumber: match[0], callerName: '', source: 'body-text' };
+          }
         }
       }
 
@@ -264,23 +286,4 @@ export class GoogleVoiceProvider implements VoiceProvider {
       timestamp: new Date(),
     };
   }
-}
-
-export function normalizePhoneNumber(raw: string): string {
-  const digits = raw.replace(/\D/g, '');
-  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
-  if (digits.length === 10) return `+1${digits}`;
-  if (digits.length > 10) return `+${digits}`;
-  return digits.length > 0 ? `+${digits}` : '';
-}
-
-export function isAuthorized(call: CallInfo, authorizedNumbers: string[], authorizedNames?: string[]): boolean {
-  if (authorizedNumbers.length > 0 && authorizedNumbers.includes(call.phoneNumber)) return true;
-  if (authorizedNames && authorizedNames.length > 0 && call.callerName) {
-    const lowerName = call.callerName.toLowerCase();
-    for (const authName of authorizedNames) {
-      if (authName && lowerName.includes(authName.toLowerCase())) return true;
-    }
-  }
-  return false;
 }

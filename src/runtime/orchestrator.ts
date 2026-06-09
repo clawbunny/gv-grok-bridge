@@ -10,6 +10,8 @@ import type { AIController } from './ai-controller';
 import type { XvfbManager } from './xvfb';
 import type { VoiceProvider, AIProvider } from '../providers/contracts';
 import type { Logger } from '../logger';
+import type { AlertManager } from './alert/manager';
+import type { StatusFileWriter } from './status/writer';
 
 export { BridgeConfig, BridgeStatus };
 
@@ -28,6 +30,8 @@ export class BridgeOrchestrator {
     private aiProvider: AIProvider,
     private xvfbManager: XvfbManager,
     private logger: Logger,
+    private alertManager?: AlertManager,
+    private statusWriter?: StatusFileWriter,
   ) {
     this.status = this.createDefaultStatus();
   }
@@ -271,6 +275,10 @@ export class BridgeOrchestrator {
             this.config.tempProfilePath,
           );
         }
+
+        const criticalIssues = this.alertManager?.detectCriticalIssues(this.status) ?? [];
+        this.statusWriter?.write(this.status, criticalIssues);
+        this.alertManager?.checkAndAlert(this.status, this.config.alertEmail);
       } catch (err) {
         this.logger.error('Health check error', { error: (err as Error).message });
       }

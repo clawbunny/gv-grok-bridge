@@ -118,6 +118,8 @@ export interface BridgeConfig {
   voiceProvider: ProviderRef;
   /** AI provider reference */
   aiProvider: ProviderRef;
+  /** Alert email address for critical failures */
+  alertEmail?: string;
 }
 
 export interface BridgeStatus {

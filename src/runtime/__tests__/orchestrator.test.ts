@@ -11,6 +11,8 @@ import { VoiceMonitor } from '../monitor';
 import { AIController } from '../ai-controller';
 import type { BridgeConfig, BrowserPair, CallInfo, AudioDevices } from '../../types';
 import type { VoiceProvider, AIProvider } from '../../providers/contracts';
+import type { AlertManager } from '../alert/manager';
+import type { StatusFileWriter } from '../status/writer';
 
 function createMocks() {
   const logger: jest.Mocked<Logger> = {
@@ -29,6 +31,15 @@ function createMocks() {
     } as AudioDevices),
     teardown: jest.fn().mockResolvedValue(undefined),
     fixStreamRouting: jest.fn().mockResolvedValue(undefined),
+    fixSinkRouting: jest.fn().mockResolvedValue(undefined),
+    deviceNames: {
+      voiceSink: 'pipe_voice_to_ai_test',
+      aiSink: 'pipe_ai_to_voice_test',
+      voiceSource: 'src_voice_to_ai_test',
+      aiSource: 'src_ai_to_voice_test',
+    },
+    setDefaultSource: jest.fn().mockResolvedValue(undefined),
+    setDefaultSink: jest.fn().mockResolvedValue(undefined),
   } as unknown as jest.Mocked<AudioPipeline>;
 
   const mockVoicePage = { url: jest.fn().mockReturnValue('https://voice.google.com') };
@@ -112,6 +123,15 @@ function createMocks() {
     isRunning: jest.fn().mockReturnValue(false),
   } as unknown as jest.Mocked<XvfbManager>;
 
+  const alertManager = {
+    checkAndAlert: jest.fn(),
+    detectCriticalIssues: jest.fn().mockReturnValue([]),
+  } as unknown as jest.Mocked<AlertManager>;
+
+  const statusWriter = {
+    write: jest.fn(),
+  } as unknown as jest.Mocked<StatusFileWriter>;
+
   return {
     logger,
     audioPipeline,
@@ -121,6 +141,8 @@ function createMocks() {
     voiceProvider,
     aiProvider,
     xvfbManager,
+    alertManager,
+    statusWriter,
   };
 }
 
@@ -157,6 +179,8 @@ describe('BridgeOrchestrator', () => {
       mocks.aiProvider as any,
       mocks.xvfbManager as any,
       mocks.logger as any,
+      mocks.alertManager as any,
+      mocks.statusWriter as any,
     );
   });
 
@@ -195,6 +219,8 @@ describe('BridgeOrchestrator', () => {
         mocks.aiProvider as any,
         mocks.xvfbManager as any,
         mocks.logger as any,
+        mocks.alertManager as any,
+        mocks.statusWriter as any,
       );
 
       await orchestrator.start();
@@ -251,6 +277,81 @@ describe('BridgeOrchestrator', () => {
 
       expect(orchestrator.getStatus().inCall).toBe(false);
       expect(mocks.aiController.deactivateVoiceMode).toHaveBeenCalled();
+    });
+  });
+
+  describe('health checks with status writer and alert manager', () => {
+    beforeEach(async () => {
+      jest.useFakeTimers();
+      await orchestrator.start();
+      jest.clearAllMocks();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('writes status file during health checks', async () => {
+      jest.advanceTimersByTime(10000);
+      jest.runAllTicks();
+      await Promise.resolve();
+
+      expect(mocks.statusWriter.write).toHaveBeenCalledWith(
+        expect.objectContaining({ running: true }),
+        [],
+      );
+    });
+
+    it('passes detected critical issues to status writer', async () => {
+      mocks.alertManager.detectCriticalIssues.mockReturnValue(['voice_not_logged_in', 'audio_not_ready']);
+
+      jest.advanceTimersByTime(10000);
+      jest.runAllTicks();
+      await Promise.resolve();
+
+      expect(mocks.statusWriter.write).toHaveBeenCalledWith(
+        expect.objectContaining({ running: true }),
+        ['voice_not_logged_in', 'audio_not_ready'],
+      );
+    });
+
+    it('checks alerts during health checks', async () => {
+      jest.advanceTimersByTime(10000);
+      jest.runAllTicks();
+      await Promise.resolve();
+
+      expect(mocks.alertManager.checkAndAlert).toHaveBeenCalledWith(
+        expect.objectContaining({ running: true }),
+        undefined, // no alertEmail in defaultConfig
+      );
+    });
+
+    it('passes alertEmail to alertManager when configured', async () => {
+      const alertConfig = { ...defaultConfig, alertEmail: 'admin@example.com' };
+      orchestrator = new BridgeOrchestrator(
+        alertConfig,
+        mocks.audioPipeline as any,
+        mocks.browserManager as any,
+        mocks.voiceMonitor as any,
+        mocks.aiController as any,
+        mocks.voiceProvider as any,
+        mocks.aiProvider as any,
+        mocks.xvfbManager as any,
+        mocks.logger as any,
+        mocks.alertManager as any,
+        mocks.statusWriter as any,
+      );
+      await orchestrator.start();
+      jest.clearAllMocks();
+
+      jest.advanceTimersByTime(10000);
+      jest.runAllTicks();
+      await Promise.resolve();
+
+      expect(mocks.alertManager.checkAndAlert).toHaveBeenCalledWith(
+        expect.anything(),
+        'admin@example.com',
+      );
     });
   });
 });

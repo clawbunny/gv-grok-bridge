@@ -22,7 +22,9 @@ import { BridgeOrchestrator } from './runtime/orchestrator';
 import { getVoiceProvider, getAIProvider } from './providers';
 import { loadInstance } from './instance/registry';
 import { instanceConfigToBridgeConfig, type InstanceConfig } from './instance/config';
-import { getInstanceConfigPath } from './instance/paths';
+import { getInstanceConfigPath, getInstanceStatusPath, getInstanceLogDir } from './instance/paths';
+import { AlertManager } from './runtime/alert/manager';
+import { StatusFileWriter } from './runtime/status/writer';
 
 const execAsync = promisify(exec);
 
@@ -98,8 +100,8 @@ async function main(): Promise<void> {
   let voiceProvider;
   let aiProvider;
   try {
-    voiceProvider = getVoiceProvider(config.voiceProvider.type);
-    aiProvider = getAIProvider(config.aiProvider.type);
+    voiceProvider = getVoiceProvider(config.voiceProvider.type, config.voiceProvider.config);
+    aiProvider = getAIProvider(config.aiProvider.type, config.aiProvider.config);
   } catch (err) {
     logger.error('Failed to resolve providers', { error: (err as Error).message });
     process.exit(1);
@@ -121,6 +123,12 @@ async function main(): Promise<void> {
   const aiController = new AIController(logger);
   const xvfbManager = new XvfbManager(logger);
 
+  const statusWriter = new StatusFileWriter(getInstanceStatusPath(instanceId));
+  const alertManager = new AlertManager(
+    { instanceId, logDir: getInstanceLogDir(instanceId) },
+    logger,
+  );
+
   const bridge = new BridgeOrchestrator(
     config,
     audioPipeline,
@@ -131,6 +139,8 @@ async function main(): Promise<void> {
     aiProvider,
     xvfbManager,
     logger,
+    alertManager,
+    statusWriter,
   );
 
   // ── Graceful shutdown ──────────────────────────────

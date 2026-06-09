@@ -70,14 +70,16 @@ make dist
 
 ## Quick Start
 
-### 1. Log In (Critical!)
+### 1. Authenticate (Critical!)
 
-You must be logged in to your chosen services in your default Chromium profile:
+The bridge requires active browser sessions for both providers. See [`docs/authentication.md`](docs/authentication.md) for the full workflow, including cookie import for headless servers.
 
-- Open your regular Chromium browser
-- Go to your voice provider (e.g., `https://voice.google.com`) and log in
-- Go to your AI provider (e.g., `https://grok.com`) and log in
-- **Close Chromium** (the bridge will use the same profile)
+In short:
+
+- Stop the bridge: `voicebridge stop <instance-id>`
+- Open Chromium with the bridge profile and log in to both providers
+- Close Chromium properly (Ctrl+Q)
+- Start the bridge: `voicebridge start <instance-id>`
 
 ### 2. Create an Instance
 
@@ -251,6 +253,50 @@ voicebridge-run
 ### PulseAudio module leaks
 - Each instance cleans up its own stale modules on startup
 - If you see duplicates, restart the instance: `voicebridge restart <id>`
+
+## Monitoring & Alerting
+
+### Enhanced Status Command
+
+`voicebridge status` now shows both systemd service state **and** the bridge's internal health:
+
+```bash
+voicebridge status my-instance
+```
+
+Output includes:
+- Systemd service state (active/inactive)
+- Bridge internal state (running, audio ready, browser readiness, login state)
+- **Critical issues** (e.g., "Voice provider not logged in")
+- Exit code `1` if critical issues are detected
+
+### Email Alerts
+
+Configure an alert email address in your instance YAML to receive notifications when critical failures occur:
+
+```yaml
+instanceId: my-instance
+voiceProvider:
+  type: google-voice
+aiProvider:
+  type: grok
+alertEmail: admin@example.com
+```
+
+**Critical failures** that trigger alerts:
+- Voice provider not logged in
+- AI provider not logged in
+- Browser not ready
+- Audio pipeline not ready
+- Bridge not running
+
+Alerts are rate-limited to **one per hour per issue type** to avoid spam. They reset when the issue is resolved.
+
+**Prerequisite:** The server must have an MTA installed (e.g., `postfix`, `nullmailer`, or `msmtp`) providing `/usr/sbin/sendmail`. If sendmail is not found, alerts are logged as warnings.
+
+### Status File
+
+The bridge writes its current state to `~/.local/state/gv-bridge/instances/<id>/status.json` every 10 seconds. This allows the `voicebridge status` command to inspect runtime health without IPC.
 
 ## License
 

@@ -21,6 +21,7 @@ export interface InstanceConfig {
   logLevel: LogLevel;
   profilePath?: string;
   extraArgs?: string[];
+  alertEmail?: string;
 }
 
 export function createDefaultConfig(instanceId: string): InstanceConfig {
@@ -80,5 +81,6 @@ export function instanceConfigToBridgeConfig(config: InstanceConfig): import('..
     logLevel: config.logLevel,
     voiceProvider: config.voiceProvider,
     aiProvider: config.aiProvider,
+    alertEmail: config.alertEmail,
   };
 }
