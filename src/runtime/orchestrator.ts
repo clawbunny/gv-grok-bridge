@@ -118,6 +118,7 @@ export class BridgeOrchestrator {
       pollInterval: this.config.pollInterval,
     };
 
+    await this.voiceProvider.initialize(pair.voicePage, this.logger);
     await this.voiceMonitor.startMonitoring(pair.voicePage, this.voiceProvider, voiceConfig);
 
     const aiLoggedIn = await this.aiController.initialize(pair.aiPage, this.aiProvider);

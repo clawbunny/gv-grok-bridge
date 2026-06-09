@@ -197,6 +197,7 @@ describe('BridgeOrchestrator', () => {
       expect(mocks.audioPipeline.setup).toHaveBeenCalled();
       expect(mocks.xvfbManager.start).toHaveBeenCalledWith(':99');
       expect(mocks.browserManager.launch).toHaveBeenCalled();
+      expect(mocks.voiceProvider.initialize).toHaveBeenCalled();
       expect(mocks.voiceMonitor.startMonitoring).toHaveBeenCalled();
       expect(mocks.aiController.initialize).toHaveBeenCalled();
       expect(mocks.voiceMonitor.on).toHaveBeenCalled();
