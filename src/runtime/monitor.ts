@@ -15,6 +15,8 @@ export interface MonitorConfig {
   authorizedNames?: string[];
   autoAccept: boolean;
   pollInterval?: number;
+  /** Maximum time (ms) a single poll iteration may run before it is aborted. */
+  pollTimeout?: number;
 }
 
 export class VoiceMonitor {
@@ -57,7 +59,7 @@ export class VoiceMonitor {
     if (this.polling) throw new Error('Monitoring is already active');
     this.page = page;
     this.provider = provider;
-    this.config = { pollInterval: 1000, ...config };
+    this.config = { pollInterval: 1000, pollTimeout: 15000, ...config };
     this.polling = true;
     this.inCall = false;
     this.currentCall = null;
@@ -87,42 +89,53 @@ export class VoiceMonitor {
   private async poll(): Promise<void> {
     if (this.pollMutex || !this.polling || !this.page || !this.provider || !this.config) return;
     this.pollMutex = true;
+    const timeoutMs = this.config.pollTimeout ?? 15000;
     try {
-      if (!this.inCall) {
-        const callInfo = await this.provider.detectIncomingCall(this.page, this.logger);
-        if (callInfo) {
-          this.logger.info(`Incoming call from ${callInfo.callerName || 'Unknown'} (${callInfo.phoneNumber})`);
-          this.currentCall = callInfo;
-          this.emit('incomingCall', callInfo);
-          if (isAuthorized(callInfo, this.config.authorizedNumbers, this.config.authorizedNames)) {
-            this.logger.info(`ALLOWED — ${callInfo.phoneNumber} is authorized`);
-            if (this.config.autoAccept) {
-              await this.provider.acceptCall(this.page, this.logger);
-              this.inCall = true;
-              this.emit('callAccepted', callInfo);
-              this.logger.info(`Call accepted from ${callInfo.phoneNumber}`);
-            }
-          } else {
-            this.logger.info(`DENIED — ${callInfo.phoneNumber} is NOT authorized`);
-            await this.provider.declineCall(this.page, this.logger);
-            this.currentCall = null;
-          }
-        }
-      } else {
-        const active = await this.provider.isCallActive(this.page, this.logger);
-        if (!active) {
-          this.logger.info('Call ended');
-          this.inCall = false;
-          this.currentCall = null;
-          this.emit('callEnded');
-        }
-      }
+      await Promise.race([
+        this.runPollCycle(),
+        new Promise<void>((_, reject) => {
+          setTimeout(() => reject(new Error(`Poll cycle timed out after ${timeoutMs}ms`)), timeoutMs);
+        }),
+      ]);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       this.logger.error('Error during poll', { message: error.message });
       this.emit('error', error);
     } finally {
       this.pollMutex = false;
+    }
+  }
+
+  private async runPollCycle(): Promise<void> {
+    if (!this.page || !this.provider || !this.config) return;
+    if (!this.inCall) {
+      const callInfo = await this.provider.detectIncomingCall(this.page, this.logger);
+      if (callInfo) {
+        this.logger.info(`Incoming call from ${callInfo.callerName || 'Unknown'} (${callInfo.phoneNumber})`);
+        this.currentCall = callInfo;
+        this.emit('incomingCall', callInfo);
+        if (isAuthorized(callInfo, this.config.authorizedNumbers, this.config.authorizedNames)) {
+          this.logger.info(`ALLOWED — ${callInfo.phoneNumber} is authorized`);
+          if (this.config.autoAccept) {
+            await this.provider.acceptCall(this.page, this.logger);
+            this.inCall = true;
+            this.emit('callAccepted', callInfo);
+            this.logger.info(`Call accepted from ${callInfo.phoneNumber}`);
+          }
+        } else {
+          this.logger.info(`DENIED — ${callInfo.phoneNumber} is NOT authorized`);
+          await this.provider.declineCall(this.page, this.logger);
+          this.currentCall = null;
+        }
+      }
+    } else {
+      const active = await this.provider.isCallActive(this.page, this.logger);
+      if (!active) {
+        this.logger.info('Call ended');
+        this.inCall = false;
+        this.currentCall = null;
+        this.emit('callEnded');
+      }
     }
   }
 

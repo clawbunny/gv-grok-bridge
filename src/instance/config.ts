@@ -21,6 +21,8 @@ export interface InstanceConfig {
   logLevel: LogLevel;
   profilePath?: string;
   extraArgs?: string[];
+  /** Hours between prophylactic provider-page reloads (default: 6) */
+  pageReloadIntervalHours?: number;
 }
 
 export function createDefaultConfig(instanceId: string): InstanceConfig {
@@ -80,5 +82,6 @@ export function instanceConfigToBridgeConfig(config: InstanceConfig): import('..
     logLevel: config.logLevel,
     voiceProvider: config.voiceProvider,
     aiProvider: config.aiProvider,
+    pageReloadIntervalHours: config.pageReloadIntervalHours,
   };
 }

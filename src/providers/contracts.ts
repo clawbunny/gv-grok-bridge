@@ -53,4 +53,11 @@ export interface AIProvider {
 
   /** Return true if voice mode is currently active. */
   isVoiceModeActive(): boolean;
+
+  /**
+   * Optional: verify that a voice session really started after
+   * activateVoiceMode (DOM probe). Return false when the session
+   * clearly failed, e.g. quota/upsell wall or no voice UI appeared.
+   */
+  verifyVoiceSession?(page: Page, logger: Logger): Promise<boolean>;
 }

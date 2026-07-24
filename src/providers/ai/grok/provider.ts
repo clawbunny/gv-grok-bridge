@@ -190,6 +190,55 @@ export class GrokProvider implements AIProvider {
     return this.voiceModeActive;
   }
 
+  async verifyVoiceSession(page: Page, logger: Logger): Promise<boolean> {
+    try {
+      // Give the page a moment to react to the activation click
+      await page.waitForTimeout(4000);
+
+      const quotaPattern = /upgrade|subscribe|super ?grok|credit|limit reached|try again later|unavailable/i;
+
+      // A visible quota/upsell dialog is a definitive failure
+      const dialog = page.locator('div[role="dialog"], div[role="alertdialog"], div[id="dialog-portal"] [data-state="open"]').first();
+      if ((await dialog.count()) > 0) {
+        const text = (await dialog.textContent().catch(() => '')) || '';
+        if (quotaPattern.test(text)) {
+          logger.warn('Grok voice session blocked by quota/upsell dialog', { detail: text.slice(0, 120) });
+          return false;
+        }
+      }
+
+      // Positive indicators that a voice session is live
+      const activeSelectors = [
+        'button[aria-label*="stop" i]',
+        'button[aria-label*="end" i]',
+        'button[aria-label*="mute" i]',
+        '[class*="voice"][class*="active"]',
+        '[class*="listening"]',
+        '[class*="orb"]',
+      ];
+      for (const sel of activeSelectors) {
+        const loc = page.locator(sel).first();
+        if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
+          logger.debug(`Voice session verified active via selector: ${sel}`);
+          return true;
+        }
+      }
+
+      // Full-page quota text as a last check
+      const bodyText = (await page.locator('body').textContent().catch(() => '')) || '';
+      if (/(voice|audio).{0,40}(upgrade|subscribe|limit|unavailable)/i.test(bodyText)) {
+        logger.warn('Grok voice session appears unavailable (page text)');
+        return false;
+      }
+
+      logger.warn('No voice-session indicators found on Grok page after activation');
+      return false;
+    } catch (err) {
+      logger.error('Failed to verify voice session', { error: (err as Error).message });
+      return false;
+    }
+  }
+
   // ─── Private helpers ─────────────────────────────────────
 
   private async dismissCookieConsent(page: Page, logger: Logger): Promise<void> {

@@ -118,6 +118,8 @@ export interface BridgeConfig {
   voiceProvider: ProviderRef;
   /** AI provider reference */
   aiProvider: ProviderRef;
+  /** Hours between prophylactic provider-page reloads (default: 6) */
+  pageReloadIntervalHours?: number;
 }
 
 export interface BridgeStatus {
@@ -130,6 +132,16 @@ export interface BridgeStatus {
   inCall: boolean;
   currentCall?: CallInfo;
   voiceModeActive: boolean;
+  /** True when the AI voice session could not be established (e.g. out of credits) */
+  aiVoiceUnavailable: boolean;
+  /** Human-readable detail for aiVoiceUnavailable */
+  aiVoiceStatusDetail?: string;
+  /** False when the voice provider page stops answering DOM probes */
+  voicePageResponsive: boolean;
+  /** False when the AI provider page stops answering DOM probes */
+  aiPageResponsive: boolean;
+  /** ISO timestamp of the last prophylactic page reload */
+  lastPageReload?: string;
 }
 
 export type BridgeState =

@@ -30,6 +30,10 @@ export function getInstanceLogPath(instanceId: string): string {
   return path.join(getInstanceLogDir(instanceId), 'bridge.log');
 }
 
+export function getInstanceStatusPath(instanceId: string): string {
+  return path.join(getInstanceLogDir(instanceId), 'status.json');
+}
+
 export function getInstanceServicePath(instanceId: string): string {
   return path.join(os.homedir(), '.config', 'systemd', 'user', `gv-bridge-${instanceId}.service`);
 }

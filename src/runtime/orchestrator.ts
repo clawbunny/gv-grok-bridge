@@ -2,21 +2,47 @@
  * BridgeOrchestrator — connects all modules and manages the call flow.
  */
 
-import type { BridgeConfig, BridgeStatus, CallInfo, AudioDevices } from '../types';
+import type { BridgeConfig, BridgeStatus, CallInfo, AudioDevices, Page } from '../types';
 import type { AudioPipeline } from './audio/pipeline';
 import type { BrowserManager } from './browser/manager';
 import type { VoiceMonitor } from './monitor';
 import type { AIController } from './ai-controller';
 import type { XvfbManager } from './xvfb';
+import type { StatusFileWriter } from './status/writer';
 import type { VoiceProvider, AIProvider } from '../providers/contracts';
 import type { Logger } from '../logger';
 
 export { BridgeConfig, BridgeStatus };
 
+/** Number of consecutive failed DOM probes before a page is declared unresponsive. */
+const PROBE_FAILURE_THRESHOLD = 3;
+/** Timeout for a single DOM probe (ms). */
+const PROBE_TIMEOUT_MS = 5000;
+
+/** Map bridge status to human-readable critical issues for the status file / CLI. */
+export function computeCriticalIssues(status: BridgeStatus): string[] {
+  const issues: string[] = [];
+  if (status.running && !status.audioReady) issues.push('audio_not_ready');
+  if (status.running && !status.voiceBrowserReady) issues.push('voice_browser_not_ready');
+  if (status.running && !status.aiBrowserReady) issues.push('ai_browser_not_ready');
+  if (status.running && !status.voiceLoggedIn) issues.push('voice_not_logged_in');
+  if (status.running && !status.aiLoggedIn) issues.push('ai_not_logged_in');
+  if (!status.voicePageResponsive) issues.push('voice_page_unresponsive');
+  if (!status.aiPageResponsive) issues.push('ai_page_unresponsive');
+  if (status.aiVoiceUnavailable) {
+    issues.push(`ai_voice_unavailable: ${status.aiVoiceStatusDetail ?? 'AI voice session could not be established'}`);
+  }
+  return issues;
+}
+
 export class BridgeOrchestrator {
   private status: BridgeStatus;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private devices: AudioDevices | null = null;
+  private consecutiveVoiceProbeFailures = 0;
+  private consecutiveAiProbeFailures = 0;
+  private pendingRestart: string | null = null;
+  private lastReloadAt = 0;
 
   constructor(
     private config: BridgeConfig,
@@ -28,6 +54,7 @@ export class BridgeOrchestrator {
     private aiProvider: AIProvider,
     private xvfbManager: XvfbManager,
     private logger: Logger,
+    private statusWriter?: StatusFileWriter,
   ) {
     this.status = this.createDefaultStatus();
   }
@@ -50,6 +77,8 @@ export class BridgeOrchestrator {
       this.startHealthChecks();
 
       this.status.running = true;
+      this.lastReloadAt = Date.now();
+      this.writeStatusFile();
       this.logger.info('Bridge started successfully');
     } catch (err) {
       this.logger.error('Bridge startup failed', { error: (err as Error).message });
@@ -123,8 +152,20 @@ export class BridgeOrchestrator {
     this.status.aiLoggedIn = aiLoggedIn;
     this.logger.info('Login check complete', { voiceLoggedIn, aiLoggedIn });
 
-    if (!voiceLoggedIn) this.logger.warn('Voice provider not logged in');
-    if (!aiLoggedIn) this.logger.warn('AI provider not logged in');
+    if (!voiceLoggedIn) {
+      throw new Error(
+        'Voice provider (Google Voice) is not logged in. ' +
+        'Log in with: cd ~/voicebridge-setup && ./open-browser.sh, ' +
+        'then stop and restart this service.'
+      );
+    }
+    if (!aiLoggedIn) {
+      throw new Error(
+        'AI provider is not logged in. ' +
+        'Log in with: cd ~/voicebridge-setup && ./open-browser.sh, ' +
+        'then stop and restart this service.'
+      );
+    }
   }
 
   // ─── Event wiring ────────────────────────────────────────
@@ -189,6 +230,25 @@ export class BridgeOrchestrator {
       const activated = await this.aiController.activateVoiceMode(pair.aiPage);
       this.status.voiceModeActive = activated;
 
+      // Verify a voice session really started — activation clicks can
+      // silently no-op (e.g. account out of voice credits)
+      if (activated && this.aiProvider.verifyVoiceSession) {
+        const verified = await this.aiProvider.verifyVoiceSession(pair.aiPage, this.logger);
+        if (verified) {
+          if (this.status.aiVoiceUnavailable) {
+            this.logger.info('AI voice session verified — clearing aiVoiceUnavailable');
+          }
+          this.status.aiVoiceUnavailable = false;
+          this.status.aiVoiceStatusDetail = undefined;
+        } else {
+          this.status.aiVoiceUnavailable = true;
+          this.status.aiVoiceStatusDetail =
+            'AI voice session did not start after activation click (account may be out of voice credits)';
+          this.logger.error('AI voice session verification failed', { detail: this.status.aiVoiceStatusDetail });
+        }
+        this.writeStatusFile();
+      }
+
       setTimeout(() => {
         this.audioPipeline.fixStreamRouting(
           this.config.defaultProfilePath,
@@ -247,6 +307,11 @@ export class BridgeOrchestrator {
       this.logger.error('Error deactivating AI voice mode', { error: (err as Error).message });
       this.status.voiceModeActive = false;
     }
+
+    // A restart deferred while the call was active can proceed now
+    if (this.pendingRestart) {
+      await this.maybeRestart();
+    }
   }
 
   // ─── Health checks ───────────────────────────────────────
@@ -254,28 +319,139 @@ export class BridgeOrchestrator {
   private startHealthChecks(): void {
     this.healthCheckTimer = setInterval(async () => {
       try {
-        const healthy = await this.browserManager.healthCheck();
-        if (!healthy) {
-          this.logger.error('Browser health check failed');
-          this.status.voiceBrowserReady = false;
-          this.status.aiBrowserReady = false;
-        }
-
-        if (this.status.inCall) {
-          await this.audioPipeline.fixStreamRouting(
-            this.config.defaultProfilePath,
-            this.config.tempProfilePath,
-          );
-          await this.audioPipeline.fixSinkRouting(
-            this.config.defaultProfilePath,
-            this.config.tempProfilePath,
-          );
-        }
+        await this.runHealthTick();
       } catch (err) {
         this.logger.error('Health check error', { error: (err as Error).message });
       }
     }, 10000);
     this.logger.debug('Health checks started (interval: 10000ms)');
+  }
+
+  private async runHealthTick(): Promise<void> {
+    const healthy = await this.browserManager.healthCheck();
+    if (!healthy) {
+      this.logger.error('Browser health check failed');
+      this.status.voiceBrowserReady = false;
+      this.status.aiBrowserReady = false;
+    }
+
+    // DOM probes — detect pages that are hung or otherwise unresponsive
+    await this.probePages();
+
+    if (this.status.inCall) {
+      await this.audioPipeline.fixStreamRouting(
+        this.config.defaultProfilePath,
+        this.config.tempProfilePath,
+      );
+      await this.audioPipeline.fixSinkRouting(
+        this.config.defaultProfilePath,
+        this.config.tempProfilePath,
+      );
+    }
+
+    // Prophylactic reload of provider pages (idle only) — prevents
+    // long-lived pages from silently losing their backend connection
+    await this.maybeReloadPages();
+
+    // Persist status for CLI inspection (voicebridge status <id>)
+    this.writeStatusFile();
+
+    // Escalate unrecoverable states to a systemd-managed restart
+    await this.maybeRestart();
+  }
+
+  private async probePages(): Promise<void> {
+    const pair = this.browserManager.getPair();
+    if (!pair) return;
+
+    const probe = async (page: Page): Promise<boolean> => {
+      try {
+        await Promise.race([
+          page.evaluate(() => document.title),
+          new Promise((_, reject) => {
+            const t = setTimeout(() => reject(new Error('probe timeout')), PROBE_TIMEOUT_MS);
+            (t as { unref?: () => void }).unref?.();
+          }),
+        ]);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const voiceOk = await probe(pair.voicePage);
+    const aiOk = await probe(pair.aiPage);
+
+    this.consecutiveVoiceProbeFailures = voiceOk ? 0 : this.consecutiveVoiceProbeFailures + 1;
+    this.consecutiveAiProbeFailures = aiOk ? 0 : this.consecutiveAiProbeFailures + 1;
+
+    this.status.voicePageResponsive = this.consecutiveVoiceProbeFailures < PROBE_FAILURE_THRESHOLD;
+    this.status.aiPageResponsive = this.consecutiveAiProbeFailures < PROBE_FAILURE_THRESHOLD;
+
+    if (!voiceOk) {
+      this.logger.warn('Voice page probe failed', { consecutiveFailures: this.consecutiveVoiceProbeFailures });
+    }
+    if (!aiOk) {
+      this.logger.warn('AI page probe failed', { consecutiveFailures: this.consecutiveAiProbeFailures });
+    }
+  }
+
+  private async maybeReloadPages(): Promise<void> {
+    if (this.status.inCall) return;
+    const intervalMs = (this.config.pageReloadIntervalHours ?? 6) * 3600 * 1000;
+    if (Date.now() - this.lastReloadAt < intervalMs) return;
+
+    const pair = this.browserManager.getPair();
+    if (!pair) return;
+
+    this.logger.info('Prophylactic provider page reload starting');
+    try {
+      await pair.voicePage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+      const voiceLoggedIn = await this.voiceProvider.checkLoggedIn(pair.voicePage, this.logger);
+      this.status.voiceLoggedIn = voiceLoggedIn;
+      if (!voiceLoggedIn) throw new Error('voice provider not logged in after page reload');
+
+      await pair.aiPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+      const aiLoggedIn = await this.aiController.initialize(pair.aiPage, this.aiProvider);
+      this.status.aiLoggedIn = aiLoggedIn;
+      if (!aiLoggedIn) throw new Error('AI provider not logged in after page reload');
+
+      this.lastReloadAt = Date.now();
+      this.status.lastPageReload = new Date(this.lastReloadAt).toISOString();
+      this.consecutiveVoiceProbeFailures = 0;
+      this.consecutiveAiProbeFailures = 0;
+      this.logger.info('Prophylactic provider page reload complete');
+    } catch (err) {
+      this.logger.error('Prophylactic page reload failed', { error: (err as Error).message });
+      this.pendingRestart = `page reload failed: ${(err as Error).message}`;
+    }
+  }
+
+  private async maybeRestart(): Promise<void> {
+    if (!this.pendingRestart) {
+      if (this.consecutiveVoiceProbeFailures >= PROBE_FAILURE_THRESHOLD) {
+        this.pendingRestart = 'voice page unresponsive (consecutive probe failures)';
+      } else if (this.consecutiveAiProbeFailures >= PROBE_FAILURE_THRESHOLD) {
+        this.pendingRestart = 'AI page unresponsive (consecutive probe failures)';
+      }
+    }
+    if (!this.pendingRestart) return;
+
+    if (this.status.inCall) {
+      this.logger.warn('Restart pending but call active — deferring', { reason: this.pendingRestart });
+      return;
+    }
+
+    const reason = this.pendingRestart;
+    this.logger.error('Fatal condition — restarting bridge via systemd', { reason });
+    this.writeStatusFile([`restarting: ${reason}`]);
+    await this.stop();
+    process.exit(1);
+  }
+
+  private writeStatusFile(extraIssues: string[] = []): void {
+    if (!this.statusWriter) return;
+    this.statusWriter.write(this.getStatus(), [...computeCriticalIssues(this.status), ...extraIssues]);
   }
 
   // ─── Status helpers ──────────────────────────────────────
@@ -290,6 +466,9 @@ export class BridgeOrchestrator {
       aiLoggedIn: false,
       inCall: false,
       voiceModeActive: false,
+      aiVoiceUnavailable: false,
+      voicePageResponsive: true,
+      aiPageResponsive: true,
     };
   }
 }
