@@ -103,6 +103,10 @@ export class BridgeOrchestrator {
   async start(): Promise<void> {
     this.logger.info('Starting Bridge', this.config as unknown as Record<string, unknown>);
 
+    // Chromium launch + login checks can exceed the runtime watchdog
+    // period — extend it during startup, tighten again once READY.
+    this.sdNotify('WATCHDOG_USEC=180000000');
+
     try {
       this.transition('SETUP_AUDIO');
       await this.setupAudio();
@@ -124,6 +128,7 @@ export class BridgeOrchestrator {
       this.transition('IDLE');
       this.writeStatusFile();
       this.sdNotify('READY=1');
+      this.sdNotify('WATCHDOG_USEC=45000000');
       this.logger.info('Bridge started successfully');
     } catch (err) {
       this.logger.error('Bridge startup failed', { error: (err as Error).message });
@@ -723,7 +728,9 @@ export class BridgeOrchestrator {
   /** Best-effort sd_notify; no-op when not running under systemd. */
   private sdNotify(message: string): void {
     if (!process.env.NOTIFY_SOCKET) return;
-    execFile('systemd-notify', [message], () => { /* best effort */ });
+    // --pid: the notification must be attributed to the service's main PID,
+    // otherwise NotifyAccess=main silently drops it.
+    execFile('systemd-notify', [`--pid=${process.pid}`, message], () => { /* best effort */ });
   }
 
   // ─── Status helpers ──────────────────────────────────────

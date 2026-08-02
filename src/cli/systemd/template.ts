@@ -35,6 +35,7 @@ StartLimitBurst=5
 # The bridge pings the watchdog on every healthy 10s health tick;
 # if the process is alive but wedged, systemd restarts it.
 WatchdogSec=45
+NotifyAccess=all
 # Logs go to the journal (auto-rotated, size-capped) — query with:
 #   journalctl --user -u gv-bridge-${instanceId} -f
 StandardOutput=journal
