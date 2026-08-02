@@ -191,6 +191,31 @@ describe('VoiceMonitor', () => {
       expect(timeoutHandler).toHaveBeenCalled();
     });
 
+    it('applies defaults when optional config keys are passed as undefined', async () => {
+      // Production regression (2026-08-01): the orchestrator passes
+      // acceptTimeoutMs/acceptRetries straight from the instance YAML, where
+      // they are absent → undefined. Spreading them over the defaults turned
+      // attempts into NaN and the accept loop never ran — every call was
+      // declined instantly. The monitor must coalesce, not spread.
+      const call: CallInfo = { phoneNumber: '+14085506532', callerName: 'Alice', timestamp: new Date() };
+      const provider = createMockProvider({
+        detectIncomingCall: jest.fn().mockResolvedValue(call),
+        acceptCall: jest.fn().mockResolvedValue(undefined),
+      });
+
+      await monitor.startMonitoring(createMockPage(), provider, {
+        authorizedNumbers: ['+14085506532'],
+        autoAccept: true,
+        acceptTimeoutMs: undefined,
+        acceptRetries: undefined,
+        pollInterval: undefined,
+        pollTimeout: undefined,
+      });
+
+      expect(provider.acceptCall).toHaveBeenCalledTimes(1);
+      expect(monitor.isInCall()).toBe(true);
+    });
+
     it('releases pollMutex and continues after a poll timeout', async () => {
       jest.useRealTimers();
       const provider = createMockProvider({

@@ -81,13 +81,18 @@ export class VoiceMonitor {
     if (this.polling) throw new Error('Monitoring is already active');
     this.page = page;
     this.provider = provider;
+    // Coalesce explicitly: callers may pass keys with undefined values,
+    // and `...config` would otherwise overwrite the defaults with undefined
+    // (production incident: acceptRetries=undefined → attempts=NaN → the
+    // accept loop never ran and every call was "failed" instantly).
     this.config = {
-      pollInterval: 1000,
-      pollTimeout: 15000,
-      acceptTimeoutMs: 5000,
-      acceptRetries: 1,
-      authorizedNames: [],
-      ...config,
+      authorizedNumbers: config.authorizedNumbers,
+      authorizedNames: config.authorizedNames ?? [],
+      autoAccept: config.autoAccept,
+      pollInterval: config.pollInterval ?? 1000,
+      pollTimeout: config.pollTimeout ?? 15000,
+      acceptTimeoutMs: config.acceptTimeoutMs ?? 5000,
+      acceptRetries: config.acceptRetries ?? 1,
     };
     this.polling = true;
     this.inCall = false;
