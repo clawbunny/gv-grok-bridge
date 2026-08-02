@@ -2,10 +2,22 @@
  * Google Voice Provider — implements VoiceProvider for voice.google.com
  */
 
-import type { Page } from 'playwright';
+import type { Page, BrowserContext } from 'playwright';
 import type { Logger } from '../../../logger';
 import type { CallInfo } from '../../../types';
 import type { VoiceProvider } from '../../contracts';
+import * as fs from 'fs';
+
+interface CookieEntry {
+  domain: string;
+  name: string;
+  value: string;
+  path: string;
+  expires?: number;
+  secure?: boolean;
+  httpOnly?: boolean;
+  sameSite?: number | string;
+}
 
 export class GoogleVoiceProvider implements VoiceProvider {
   readonly id = 'google-voice';
@@ -13,12 +25,24 @@ export class GoogleVoiceProvider implements VoiceProvider {
   readonly url = 'https://voice.google.com';
   readonly origin = 'https://voice.google.com';
 
+  constructor(private cookiePath?: string) {}
+
   async initialize(page: Page, logger: Logger): Promise<boolean> {
+    const context = page.context() as BrowserContext;
+
     try {
-      await page.context().grantPermissions(['microphone'], { origin: this.origin });
+      await context.grantPermissions(['microphone'], { origin: this.origin });
       logger.debug('Microphone permission granted for Google Voice');
     } catch (err) {
       logger.warn('Failed to grant microphone permissions', { error: (err as Error).message });
+    }
+
+    if (this.cookiePath && fs.existsSync(this.cookiePath)) {
+      try {
+        await this.loadCookies(context, logger);
+      } catch (err) {
+        logger.warn('Failed to load cookies', { error: (err as Error).message });
+      }
     }
 
     const isLoggedIn = await this.checkLoggedIn(page, logger);
@@ -133,6 +157,36 @@ export class GoogleVoiceProvider implements VoiceProvider {
   }
 
   // ─── Private helpers ─────────────────────────────────────
+
+  private async loadCookies(context: BrowserContext, logger: Logger): Promise<void> {
+    if (!this.cookiePath) return;
+    const raw = fs.readFileSync(this.cookiePath, 'utf-8');
+    const data = JSON.parse(raw);
+    const cookies: CookieEntry[] = data.cookies || [];
+
+    const formatted = cookies.map((c) => ({
+      name: c.name,
+      value: c.value,
+      domain: c.domain,
+      path: c.path,
+      expires: c.expires && c.expires > 0 ? Math.floor((c.expires - 11644473600000000) / 1000000) : -1,
+      httpOnly: c.httpOnly ?? false,
+      secure: c.secure ?? false,
+      sameSite: typeof c.sameSite === 'number' ? this.mapSameSite(c.sameSite) : (c.sameSite as 'Strict' | 'Lax' | 'None' | undefined),
+    }));
+
+    await context.addCookies(formatted);
+    logger.info(`Loaded ${formatted.length} cookies into browser context`);
+  }
+
+  private mapSameSite(sameSite: number): 'Strict' | 'Lax' | 'None' | undefined {
+    switch (sameSite) {
+      case 0: return 'None';
+      case 1: return 'Lax';
+      case 2: return 'Strict';
+      default: return undefined;
+    }
+  }
 
   private async isCallUIVisible(page: Page): Promise<boolean> {
     try {

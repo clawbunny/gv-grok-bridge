@@ -29,6 +29,8 @@ export interface InstanceConfig {
   acceptRetries?: number;
   /** Canary self-test: calls from this number are treated as end-to-end probes */
   canaryNumber?: string;
+  /** Alert email address for critical failures (used by the heartbeat watchdog) */
+  alertEmail?: string;
 }
 
 export function createDefaultConfig(instanceId: string): InstanceConfig {
@@ -92,5 +94,6 @@ export function instanceConfigToBridgeConfig(config: InstanceConfig): import('..
     acceptTimeoutMs: config.acceptTimeoutMs,
     acceptRetries: config.acceptRetries,
     canaryNumber: config.canaryNumber,
+    alertEmail: config.alertEmail,
   };
 }

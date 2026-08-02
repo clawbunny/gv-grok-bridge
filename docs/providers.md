@@ -1,6 +1,42 @@
-# Adding New Providers
+# Providers
 
 GV Bridge uses a simple plugin architecture. To add a new voice provider or AI provider, implement the corresponding interface and register it in the provider factory.
+
+## Available Providers
+
+| Type | ID | Description |
+|------|-----|-------------|
+| Voice | `google-voice` | Google Voice (voice.google.com) |
+| Voice | `twilio` | Twilio (stub — not yet implemented) |
+| Voice | `textnow` | TextNow (www.textnow.com) — supports cookie import for cross-device auth |
+| AI | `grok` | Grok (grok.com) |
+| AI | `chatgpt` | ChatGPT (stub — not yet implemented) |
+
+### Cookie Import
+
+Both the **Google Voice** and **TextNow** providers support loading cookies from a JSON file exported from another device. This is useful when you cannot log in directly on the Linux bridge device (e.g., a headless VPS).
+
+#### Google Voice
+
+```yaml
+voiceProvider:
+  type: google-voice
+  config:
+    cookiePath: /path/to/gv-cookies.json
+```
+
+#### TextNow
+
+```yaml
+voiceProvider:
+  type: textnow
+  config:
+    cookiePath: /path/to/textnow-cookies.json
+```
+
+The cookie JSON format matches the Chrome cookie export script (`export-cookies.py`). See `docs/authentication.md` for the full export workflow.
+
+## Adding New Providers
 
 ## Voice Provider
 

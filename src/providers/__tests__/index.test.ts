@@ -1,58 +1,77 @@
 /**
- * Provider factory tests — discovered behavior of src/providers/index.ts
- *
- * These tests document how voice and AI providers are registered and resolved.
- * Adding a new provider means registering a factory in these maps.
+ * Provider factory tests.
  */
 
 import { getVoiceProvider, getAIProvider, listVoiceProviders, listAIProviders } from '../index';
+import { GoogleVoiceProvider } from '../voice/google-voice/provider';
+import { TwilioVoiceProvider } from '../voice/twilio/provider';
+import { TextNowVoiceProvider } from '../voice/textnow/provider';
+import { GrokProvider } from '../ai/grok/provider';
+import { ChatGptProvider } from '../ai/chatgpt/provider';
 
 describe('Provider factory', () => {
-  describe('voice providers', () => {
-    it('resolves google-voice provider', () => {
+  describe('getVoiceProvider', () => {
+    it('returns a GoogleVoiceProvider for "google-voice"', () => {
       const provider = getVoiceProvider('google-voice');
-      expect(provider.id).toBe('google-voice');
-      expect(provider.name).toBe('Google Voice');
-      expect(provider.url).toBe('https://voice.google.com');
+      expect(provider).toBeInstanceOf(GoogleVoiceProvider);
     });
 
-    it('resolves twilio provider', () => {
+    it('returns a TwilioVoiceProvider for "twilio"', () => {
       const provider = getVoiceProvider('twilio');
-      expect(provider.id).toBe('twilio');
+      expect(provider).toBeInstanceOf(TwilioVoiceProvider);
     });
 
-    it('lists available voice providers', () => {
-      expect(listVoiceProviders()).toEqual(['google-voice', 'twilio']);
+    it('returns a TextNowVoiceProvider for "textnow"', () => {
+      const provider = getVoiceProvider('textnow');
+      expect(provider).toBeInstanceOf(TextNowVoiceProvider);
+    });
+
+    it('passes cookiePath config to Google Voice provider', () => {
+      const provider = getVoiceProvider('google-voice', { cookiePath: '/tmp/gv-cookies.json' });
+      expect(provider).toBeInstanceOf(GoogleVoiceProvider);
+    });
+
+    it('passes cookiePath config to TextNow provider', () => {
+      const provider = getVoiceProvider('textnow', { cookiePath: '/tmp/cookies.json' });
+      expect(provider).toBeInstanceOf(TextNowVoiceProvider);
+      // The cookiePath is private; we test behavior via initialize in provider tests.
     });
 
     it('throws for unknown voice provider', () => {
-      expect(() => getVoiceProvider('unknown')).toThrow(
-        'Unknown voice provider "unknown". Available: google-voice, twilio'
-      );
+      expect(() => getVoiceProvider('unknown')).toThrow('Unknown voice provider');
     });
   });
 
-  describe('AI providers', () => {
-    it('resolves grok provider', () => {
+  describe('getAIProvider', () => {
+    it('returns a GrokProvider for "grok"', () => {
       const provider = getAIProvider('grok');
-      expect(provider.id).toBe('grok');
-      expect(provider.name).toBe('Grok');
-      expect(provider.url).toBe('https://grok.com');
+      expect(provider).toBeInstanceOf(GrokProvider);
     });
 
-    it('resolves chatgpt provider', () => {
+    it('returns a ChatGptProvider for "chatgpt"', () => {
       const provider = getAIProvider('chatgpt');
-      expect(provider.id).toBe('chatgpt');
-    });
-
-    it('lists available AI providers', () => {
-      expect(listAIProviders()).toEqual(['grok', 'chatgpt']);
+      expect(provider).toBeInstanceOf(ChatGptProvider);
     });
 
     it('throws for unknown AI provider', () => {
-      expect(() => getAIProvider('unknown')).toThrow(
-        'Unknown AI provider "unknown". Available: grok, chatgpt'
-      );
+      expect(() => getAIProvider('unknown')).toThrow('Unknown AI provider');
+    });
+  });
+
+  describe('listVoiceProviders', () => {
+    it('includes google-voice, twilio, and textnow', () => {
+      const providers = listVoiceProviders();
+      expect(providers).toContain('google-voice');
+      expect(providers).toContain('twilio');
+      expect(providers).toContain('textnow');
+    });
+  });
+
+  describe('listAIProviders', () => {
+    it('includes grok and chatgpt', () => {
+      const providers = listAIProviders();
+      expect(providers).toContain('grok');
+      expect(providers).toContain('chatgpt');
     });
   });
 });

@@ -51,6 +51,17 @@ function listInstances() {
   }
 }
 
+/** Scrape alertEmail from the instance YAML (regex — avoids a yaml dependency). */
+function alertEmailOf(instanceId) {
+  try {
+    const raw = fs.readFileSync(path.join(CONFIG_DIR, `${instanceId}.yaml`), 'utf-8');
+    const m = raw.match(/^\s*alertEmail:\s*(\S+)\s*$/m);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 function readJson(file) {
   try {
     return JSON.parse(fs.readFileSync(file, 'utf-8'));
@@ -114,10 +125,10 @@ function saveState(state) {
   } catch { /* best effort */ }
 }
 
-function sendAlert(subject, body) {
+function sendAlert(subject, body, toOverride) {
   const webhook = process.env.GV_WATCHDOG_WEBHOOK;
   const mailCmd = process.env.GV_WATCHDOG_MAIL_CMD;
-  const to = process.env.GV_WATCHDOG_TO || 'gvgrok@pivetta.be';
+  const to = process.env.GV_WATCHDOG_TO || toOverride || 'gvgrok@pivetta.be';
   const from = process.env.GV_WATCHDOG_FROM || `gv-bridge-watchdog@${os.hostname()}`;
 
   if (webhook) {
@@ -184,11 +195,11 @@ function main() {
         `  journalctl --user -u gv-bridge-${instanceId} -n 100`,
         `  cat ~/.local/state/gv-bridge/instances/${instanceId}/status.json`,
       ].join('\n');
-      sendAlert(subject, body);
+      sendAlert(subject, body, alertEmailOf(instanceId));
       state[instanceId] = key;
       changed = true;
     } else if (issues.length === 0 && prev) {
-      sendAlert(`[gv-bridge] ${instanceId}: recovered`, 'All watchdog checks are green again.');
+      sendAlert(`[gv-bridge] ${instanceId}: recovered`, 'All watchdog checks are green again.', alertEmailOf(instanceId));
       delete state[instanceId];
       changed = true;
     }

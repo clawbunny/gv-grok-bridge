@@ -100,8 +100,8 @@ async function main(): Promise<void> {
   let voiceProvider;
   let aiProvider;
   try {
-    voiceProvider = getVoiceProvider(config.voiceProvider.type);
-    aiProvider = getAIProvider(config.aiProvider.type);
+    voiceProvider = getVoiceProvider(config.voiceProvider.type, config.voiceProvider.config);
+    aiProvider = getAIProvider(config.aiProvider.type, config.aiProvider.config);
   } catch (err) {
     logger.error('Failed to resolve providers', { error: (err as Error).message });
     process.exit(1);

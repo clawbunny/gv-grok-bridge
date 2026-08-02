@@ -215,6 +215,7 @@ export class BridgeOrchestrator {
       acceptRetries: this.config.acceptRetries,
     };
 
+    await this.voiceProvider.initialize(pair.voicePage, this.logger);
     await this.voiceMonitor.startMonitoring(pair.voicePage, this.voiceProvider, this.monitorConfig);
 
     const aiLoggedIn = await this.aiController.initialize(pair.aiPage, this.aiProvider);
@@ -479,6 +480,7 @@ export class BridgeOrchestrator {
       if (role === 'voice') {
         await this.voiceMonitor.stopMonitoring();
         const page = await this.browserManager.recyclePage('voice');
+        await this.voiceProvider.initialize(page, this.logger);
         const loggedIn = await this.voiceProvider.checkLoggedIn(page, this.logger);
         this.status.voiceLoggedIn = loggedIn;
         if (!loggedIn) {

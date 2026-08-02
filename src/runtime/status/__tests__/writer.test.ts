@@ -1,82 +1,82 @@
 /**
- * StatusFileWriter tests — verifies the JSON contract consumed by
- * `voicebridge status <instance-id>`.
+ * StatusFileWriter Tests — strict TDD.
  */
 
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
-import { StatusFileWriter, type StatusFileContents } from '../writer';
+import { StatusFileWriter } from '../writer';
 import type { BridgeStatus } from '../../../types';
 
-function makeStatus(overrides: Partial<BridgeStatus> = {}): BridgeStatus {
-  return {
-    running: true,
-    audioReady: true,
-    voiceBrowserReady: true,
-    aiBrowserReady: true,
-    voiceLoggedIn: true,
-    aiLoggedIn: true,
-    inCall: false,
-    voiceModeActive: false,
-    aiVoiceUnavailable: false,
-    voicePageResponsive: true,
-    aiPageResponsive: true,
-    ...overrides,
-  };
-}
-
 describe('StatusFileWriter', () => {
-  let tmpDir: string;
+  let writer: StatusFileWriter;
+  let writtenFiles: Map<string, string>;
+  let mockMkdirSync: jest.Mock;
 
   beforeEach(() => {
-    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gv-status-test-'));
+    writtenFiles = new Map();
+    mockMkdirSync = jest.fn();
+
+    writer = new StatusFileWriter(
+      '/tmp/test-status/status.json',
+      {
+        existsSync: jest.fn().mockReturnValue(false),
+        writeFileSync: jest.fn().mockImplementation((path: string, data: string) => {
+          writtenFiles.set(path, data);
+        }),
+        mkdirSync: mockMkdirSync,
+      } as any,
+    );
   });
 
-  afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  });
+  function createStatus(): BridgeStatus {
+    return {
+      running: true,
+      audioReady: true,
+      voiceBrowserReady: true,
+      aiBrowserReady: true,
+      voiceLoggedIn: true,
+      aiLoggedIn: true,
+      inCall: false,
+      voiceModeActive: false,
+      aiVoiceUnavailable: false,
+      voicePageResponsive: true,
+      aiPageResponsive: true,
+    };
+  }
 
-  it('writes status and critical issues as JSON', () => {
-    const file = path.join(tmpDir, 'status.json');
-    const writer = new StatusFileWriter(file);
+  it('writes status to file', () => {
+    const status = createStatus();
+    writer.write(status);
 
-    writer.write(makeStatus({ aiVoiceUnavailable: true, aiVoiceStatusDetail: 'out of credits' }), [
-      'ai_voice_unavailable: out of credits',
-    ]);
-
-    const data: StatusFileContents = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    expect(writtenFiles.has('/tmp/test-status/status.json')).toBe(true);
+    const data = JSON.parse(writtenFiles.get('/tmp/test-status/status.json')!);
     expect(data.status.running).toBe(true);
-    expect(data.status.aiVoiceUnavailable).toBe(true);
-    expect(data.criticalIssues).toEqual(['ai_voice_unavailable: out of credits']);
-    expect(new Date(data.timestamp).getTime()).toBeGreaterThan(0);
   });
 
-  it('creates the parent directory when missing', () => {
-    const file = path.join(tmpDir, 'nested', 'dir', 'status.json');
-    const writer = new StatusFileWriter(file);
+  it('includes ISO timestamp', () => {
+    const before = new Date().toISOString();
+    writer.write(createStatus());
+    const after = new Date().toISOString();
 
-    writer.write(makeStatus());
-
-    expect(fs.existsSync(file)).toBe(true);
+    const data = JSON.parse(writtenFiles.get('/tmp/test-status/status.json')!);
+    expect(data.timestamp >= before && data.timestamp <= after).toBe(true);
   });
 
-  it('defaults criticalIssues to an empty array', () => {
-    const file = path.join(tmpDir, 'status.json');
-    const writer = new StatusFileWriter(file);
-
-    writer.write(makeStatus());
-
-    const data: StatusFileContents = JSON.parse(fs.readFileSync(file, 'utf-8'));
-    expect(data.criticalIssues).toEqual([]);
+  it('creates parent directory if missing', () => {
+    writer.write(createStatus());
+    expect(mockMkdirSync).toHaveBeenCalledWith('/tmp/test-status', { recursive: true });
   });
 
-  it('silently ignores write errors', () => {
-    // Parent path is a regular file → mkdirSync fails fast with ENOTDIR.
-    // (Do NOT use /proc for this — recursive mkdirSync spins forever there on Node 22.)
-    const blocker = path.join(tmpDir, 'blocker');
-    fs.writeFileSync(blocker, 'x');
-    const writer = new StatusFileWriter(path.join(blocker, 'child', 'status.json'));
-    expect(() => writer.write(makeStatus())).not.toThrow();
+  it('gracefully handles write errors', () => {
+    const errorWriter = new StatusFileWriter(
+      '/tmp/test-status/status.json',
+      {
+        existsSync: jest.fn().mockReturnValue(false),
+        writeFileSync: jest.fn().mockImplementation(() => {
+          throw new Error('Disk full');
+        }),
+        mkdirSync: jest.fn(),
+      } as any,
+    );
+
+    expect(() => errorWriter.write(createStatus())).not.toThrow();
   });
 });

@@ -131,6 +131,8 @@ export interface BridgeConfig {
   acceptRetries?: number;
   /** Canary self-test: treat calls from this number as end-to-end probes */
   canaryNumber?: string;
+  /** Alert email address for critical failures (used by the heartbeat watchdog) */
+  alertEmail?: string;
 }
 
 export interface BridgeStatus {

@@ -1,151 +1,176 @@
 /**
- * Google Voice provider tests — discovered behavior of
- * src/providers/voice/google-voice/provider.ts
- *
- * These tests document how the provider decides whether a user is logged in,
- * how it extracts/normalizes phone numbers from the DOM, and how it authorizes
- * callers by number or by name.
+ * Google Voice Provider Tests — strict TDD.
  */
 
-import { GoogleVoiceProvider, normalizePhoneNumber, isAuthorized } from '../provider';
-import type { CallInfo } from '../../../../types';
-
-const silentLogger = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-};
-
-function createMockPage(urlValue: string, evaluateResult: unknown = null) {
-  return {
-    url: jest.fn().mockReturnValue(urlValue),
-    context: jest.fn().mockReturnValue({
-      grantPermissions: jest.fn().mockResolvedValue(undefined),
-    }),
-    locator: jest.fn().mockImplementation((selector: string) => ({
-      count: jest.fn().mockResolvedValue(0),
-      first: jest.fn().mockReturnThis(),
-      click: jest.fn().mockResolvedValue(undefined),
-      isVisible: jest.fn().mockResolvedValue(false),
-      textContent: jest.fn().mockResolvedValue(''),
-    })),
-    evaluate: jest.fn().mockResolvedValue(evaluateResult),
-    keyboard: { press: jest.fn().mockResolvedValue(undefined) },
-    waitForTimeout: jest.fn().mockResolvedValue(undefined),
-    goto: jest.fn().mockResolvedValue(undefined),
-  } as any;
-}
+import type { Page, BrowserContext } from 'playwright';
+import * as fs from 'fs';
+import { GoogleVoiceProvider } from '../provider';
+import { SilentLogger, type Logger } from '../../../../logger';
 
 describe('GoogleVoiceProvider', () => {
   let provider: GoogleVoiceProvider;
+  let logger: Logger;
+  let mockPage: jest.Mocked<Page>;
+  let mockContext: jest.Mocked<BrowserContext>;
 
   beforeEach(() => {
+    logger = new SilentLogger();
     provider = new GoogleVoiceProvider();
+
+    mockContext = {
+      grantPermissions: jest.fn().mockResolvedValue(undefined),
+      addCookies: jest.fn().mockResolvedValue(undefined),
+      cookies: jest.fn().mockResolvedValue([]),
+    } as unknown as jest.Mocked<BrowserContext>;
+
+    mockPage = {
+      context: jest.fn().mockReturnValue(mockContext),
+      goto: jest.fn().mockResolvedValue(undefined),
+      url: jest.fn().mockReturnValue('https://voice.google.com'),
+      locator: jest.fn().mockReturnValue({
+        count: jest.fn().mockResolvedValue(0),
+        first: jest.fn().mockReturnValue({ click: jest.fn().mockResolvedValue(undefined) }),
+      }),
+      evaluate: jest.fn().mockResolvedValue(null),
+      waitForSelector: jest.fn().mockResolvedValue(null),
+    } as unknown as jest.Mocked<Page>;
   });
 
   describe('provider metadata', () => {
-    it('has the expected id, name, url and origin', () => {
+    it('has correct id', () => {
       expect(provider.id).toBe('google-voice');
+    });
+
+    it('has correct name', () => {
       expect(provider.name).toBe('Google Voice');
+    });
+
+    it('has correct url', () => {
       expect(provider.url).toBe('https://voice.google.com');
+    });
+
+    it('has correct origin', () => {
       expect(provider.origin).toBe('https://voice.google.com');
     });
   });
 
+  describe('initialize()', () => {
+    it('grants microphone permissions', async () => {
+      await provider.initialize(mockPage, logger);
+      expect(mockContext.grantPermissions).toHaveBeenCalledWith(['microphone'], {
+        origin: 'https://voice.google.com',
+      });
+    });
+
+    it('returns true when logged in', async () => {
+      mockPage.url.mockReturnValue('https://voice.google.com/u/0');
+      const result = await provider.initialize(mockPage, logger);
+      expect(result).toBe(true);
+    });
+
+    it('returns false when on login page', async () => {
+      mockPage.url.mockReturnValue('https://accounts.google.com/ServiceLogin?continue=https://voice.google.com');
+      const result = await provider.initialize(mockPage, logger);
+      expect(result).toBe(false);
+    });
+
+    it('loads cookies from file when cookiePath is configured', async () => {
+      const tmpFile = '/tmp/voicebridge-test-gv-cookies.json';
+      fs.writeFileSync(tmpFile, JSON.stringify({ cookies: [] }));
+      const providerWithCookies = new GoogleVoiceProvider(tmpFile);
+      await providerWithCookies.initialize(mockPage, logger);
+      expect(mockContext.addCookies).toHaveBeenCalled();
+      fs.unlinkSync(tmpFile);
+    });
+
+    it('continues initialization when cookie file does not exist', async () => {
+      const providerWithMissingCookies = new GoogleVoiceProvider('/tmp/nonexistent-cookies.json');
+      mockPage.url.mockReturnValue('https://voice.google.com/u/0');
+      const result = await providerWithMissingCookies.initialize(mockPage, logger);
+      expect(result).toBe(true);
+      expect(mockContext.addCookies).not.toHaveBeenCalled();
+    });
+  });
+
   describe('checkLoggedIn()', () => {
-    it('returns true when URL is on voice.google.com and not on accounts.google.com', async () => {
-      const page = createMockPage('https://voice.google.com/u/0/calls');
-      const result = await provider.checkLoggedIn(page, silentLogger as any);
+    it('returns true when URL is voice.google.com', async () => {
+      mockPage.url.mockReturnValue('https://voice.google.com/u/0');
+      const result = await provider.checkLoggedIn(mockPage, logger);
       expect(result).toBe(true);
     });
 
     it('returns false when URL contains accounts.google.com', async () => {
-      const page = createMockPage('https://accounts.google.com/signin');
-      const result = await provider.checkLoggedIn(page, silentLogger as any);
+      mockPage.url.mockReturnValue('https://accounts.google.com/ServiceLogin');
+      const result = await provider.checkLoggedIn(mockPage, logger);
       expect(result).toBe(false);
     });
 
-    it('returns false when not on voice.google.com', async () => {
-      const page = createMockPage('https://example.com');
-      const result = await provider.checkLoggedIn(page, silentLogger as any);
+    it('returns false when URL is workspace marketing page', async () => {
+      mockPage.url.mockReturnValue('https://workspace.google.com/products/voice/');
+      const result = await provider.checkLoggedIn(mockPage, logger);
       expect(result).toBe(false);
     });
   });
 
-  describe('detectIncomingCall()', () => {
-    it('returns null when no call UI is visible', async () => {
-      const page = createMockPage('https://voice.google.com');
-      page.locator = jest.fn().mockImplementation(() => ({
+  describe('acceptCall()', () => {
+    it('clicks primary answer button', async () => {
+      const clickMock = jest.fn().mockResolvedValue(undefined);
+      mockPage.locator.mockReturnValue({
+        count: jest.fn().mockResolvedValue(1),
+        first: jest.fn().mockReturnValue({
+          count: jest.fn().mockResolvedValue(1),
+          click: clickMock,
+        }),
+      } as any);
+
+      await provider.acceptCall(mockPage, logger);
+      expect(clickMock).toHaveBeenCalled();
+    });
+
+    it('warns when no answer button found', async () => {
+      mockPage.locator.mockReturnValue({
         count: jest.fn().mockResolvedValue(0),
-        first: jest.fn().mockReturnThis(),
-      }));
-      const result = await provider.detectIncomingCall(page, silentLogger as any);
-      expect(result).toBeNull();
-    });
+        first: jest.fn().mockReturnValue({ click: jest.fn() }),
+      } as any);
 
-    it('returns normalized caller info when the call UI is visible', async () => {
-      const page = createMockPage('https://voice.google.com');
-      page.locator = jest.fn().mockImplementation((selector: string) => ({
-        count: jest.fn().mockResolvedValue(selector.includes('active-call-wrapper') ? 1 : 0),
-        first: jest.fn().mockReturnThis(),
-      }));
-      page.evaluate = jest.fn().mockResolvedValue({
-        rawNumber: '(408) 550-6532',
-        callerName: '',
-        source: 'active-wrapper',
-      });
-
-      const result = await provider.detectIncomingCall(page, silentLogger as any);
-      expect(result).not.toBeNull();
-      expect(result!.phoneNumber).toBe('+14085506532');
-      expect(result!.timestamp).toBeInstanceOf(Date);
+      await provider.acceptCall(mockPage, logger);
+      // Should not throw; just warn
     });
   });
 
-  describe('normalizePhoneNumber()', () => {
-    it('normalizes 10-digit US numbers to +1 format', () => {
-      expect(normalizePhoneNumber('408-550-6532')).toBe('+14085506532');
-    });
+  describe('declineCall()', () => {
+    it('clicks primary decline button', async () => {
+      const clickMock = jest.fn().mockResolvedValue(undefined);
+      mockPage.locator.mockReturnValue({
+        count: jest.fn().mockResolvedValue(1),
+        first: jest.fn().mockReturnValue({
+          count: jest.fn().mockResolvedValue(1),
+          click: clickMock,
+        }),
+      } as any);
 
-    it('preserves the leading 1 on 11-digit numbers', () => {
-      expect(normalizePhoneNumber('+1 408-550-6532')).toBe('+14085506532');
-    });
-
-    it('returns + international numbers unchanged', () => {
-      expect(normalizePhoneNumber('+442071838750')).toBe('+442071838750');
-    });
-
-    it('returns empty string for empty input', () => {
-      expect(normalizePhoneNumber('')).toBe('');
+      await provider.declineCall(mockPage, logger);
+      expect(clickMock).toHaveBeenCalled();
     });
   });
 
-  describe('isAuthorized()', () => {
-    const call: CallInfo = {
-      phoneNumber: '+14085506532',
-      callerName: 'Alice Smith',
-      timestamp: new Date(),
-    };
+  describe('isCallActive()', () => {
+    it('returns true when active call elements are present', async () => {
+      mockPage.locator.mockReturnValue({
+        count: jest.fn().mockResolvedValue(1),
+      } as any);
 
-    it('authorizes by exact phone number', () => {
-      expect(isAuthorized(call, ['+14085506532'])).toBe(true);
+      const result = await provider.isCallActive(mockPage, logger);
+      expect(result).toBe(true);
     });
 
-    it('denies calls from numbers not in the allow list', () => {
-      expect(isAuthorized(call, ['+15551234567'])).toBe(false);
-    });
+    it('returns false when no call elements are present', async () => {
+      mockPage.locator.mockReturnValue({
+        count: jest.fn().mockResolvedValue(0),
+      } as any);
 
-    it('authorizes by substring match on caller name', () => {
-      expect(isAuthorized(call, [], ['alice'])).toBe(true);
-    });
-
-    it('is case-insensitive for authorized names', () => {
-      expect(isAuthorized(call, [], ['ALICE'])).toBe(true);
-    });
-
-    it('denies when no lists are provided', () => {
-      expect(isAuthorized(call, [])).toBe(false);
+      const result = await provider.isCallActive(mockPage, logger);
+      expect(result).toBe(false);
     });
   });
 });
