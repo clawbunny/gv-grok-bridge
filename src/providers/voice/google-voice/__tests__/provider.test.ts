@@ -33,6 +33,8 @@ describe('GoogleVoiceProvider', () => {
       }),
       evaluate: jest.fn().mockResolvedValue(null),
       waitForSelector: jest.fn().mockResolvedValue(null),
+      waitForTimeout: jest.fn().mockResolvedValue(undefined),
+      screenshot: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<Page>;
   });
 
@@ -113,7 +115,42 @@ describe('GoogleVoiceProvider', () => {
   });
 
   describe('acceptCall()', () => {
-    it('clicks primary answer button', async () => {
+    it('clicks primary answer button and verifies the pickup button dismisses', async () => {
+      const clickMock = jest.fn().mockResolvedValue(undefined);
+      // After the click, the pickup-button locator must report 0 (answered).
+      let pickupCount = 1;
+      mockPage.locator.mockImplementation((selector: string) => {
+        const isPickup = selector.includes('in-call-pickup-call');
+        return {
+          count: jest.fn().mockImplementation(() => Promise.resolve(isPickup ? pickupCount : 1)),
+          first: jest.fn().mockReturnValue({
+            count: jest.fn().mockImplementation(() => Promise.resolve(isPickup ? pickupCount : 1)),
+            click: clickMock.mockImplementation(() => {
+              pickupCount = 0;
+              return Promise.resolve(undefined);
+            }),
+          }),
+        } as any;
+      });
+
+      await provider.acceptCall(mockPage, logger);
+      expect(clickMock).toHaveBeenCalled();
+    });
+
+    it('throws when no answer button found', async () => {
+      mockPage.locator.mockReturnValue({
+        count: jest.fn().mockResolvedValue(0),
+        first: jest.fn().mockReturnValue({ click: jest.fn() }),
+      } as any);
+
+      await expect(provider.acceptCall(mockPage, logger)).rejects.toThrow(
+        'Could not find a working answer button'
+      );
+    });
+
+    it('throws when the click lands but the call keeps ringing', async () => {
+      // Pickup button never disappears → the click hit an overlay; the
+      // monitor must treat this as a failed attempt and retry/decline.
       const clickMock = jest.fn().mockResolvedValue(undefined);
       mockPage.locator.mockReturnValue({
         count: jest.fn().mockResolvedValue(1),
@@ -123,18 +160,7 @@ describe('GoogleVoiceProvider', () => {
         }),
       } as any);
 
-      await provider.acceptCall(mockPage, logger);
-      expect(clickMock).toHaveBeenCalled();
-    });
-
-    it('warns when no answer button found', async () => {
-      mockPage.locator.mockReturnValue({
-        count: jest.fn().mockResolvedValue(0),
-        first: jest.fn().mockReturnValue({ click: jest.fn() }),
-      } as any);
-
-      await provider.acceptCall(mockPage, logger);
-      // Should not throw; just warn
+      await expect(provider.acceptCall(mockPage, logger)).rejects.toThrow();
     });
   });
 

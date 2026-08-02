@@ -65,44 +65,73 @@ export class GoogleVoiceProvider implements VoiceProvider {
 
   async acceptCall(page: Page, logger: Logger): Promise<void> {
     logger.info('Trying to accept call');
+    await this.dumpCallUI(page, logger);
 
-    const primarySelectors = [
+    const selectors = [
       '[gv-test-id="in-call-pickup-call"]',
       'button[aria-label="Answer call"]',
-    ];
-    for (const selector of primarySelectors) {
-      try {
-        const locator = page.locator(selector).first();
-        if ((await locator.count()) > 0) {
-          await locator.click({ timeout: 5000, force: true });
-          logger.info('Clicked answer button (primary selector)');
-          return;
-        }
-      } catch {
-        // Try next selector
-      }
-    }
-
-    const fallbackSelectors = [
       'button:has-text("Answer")',
       'button[aria-label*="Answer" i]',
       'button:has-text("Accept")',
       'button[aria-label*="Accept" i]',
       'div[role="button"]:has-text("Answer")',
     ];
-    for (const selector of fallbackSelectors) {
+    for (const selector of selectors) {
       try {
         const locator = page.locator(selector).first();
-        if ((await locator.count()) > 0) {
-          await locator.click({ timeout: 5000, force: true });
-          logger.info('Clicked answer button (fallback selector)');
+        if ((await locator.count()) === 0) continue;
+
+        await locator.click({ timeout: 5000, force: true });
+        logger.info(`Clicked answer button (${selector})`);
+
+        // Verify the click really connected: a successful answer dismisses
+        // the pickup button. A click that lands on an overlay "succeeds"
+        // silently while the call keeps ringing — treat that as failure so
+        // the caller-facing retry/decline logic kicks in.
+        await page.waitForTimeout(1500);
+        const stillRinging = (await page.locator('[gv-test-id="in-call-pickup-call"]').count()) > 0;
+        if (!stillRinging) {
+          logger.info('Answer verified — pickup button dismissed');
           return;
         }
-      } catch {
-        // Try next selector
+        logger.warn(`Answer click on ${selector} did not connect — trying next selector`);
+      } catch (err) {
+        logger.warn(`Answer attempt via ${selector} failed: ${(err as Error).message}`);
       }
     }
-    logger.warn('Could not find answer button to click');
+    throw new Error('Could not find a working answer button');
+  }
+
+  /** Screenshot + button inventory of the call UI for post-mortem debugging. */
+  private async dumpCallUI(page: Page, logger: Logger): Promise<void> {
+    try {
+      const dir = process.env.GV_DEBUG_DIR || '/tmp/gv-bridge-debug';
+      fs.mkdirSync(dir, { recursive: true });
+      const ts = Date.now();
+      await page.screenshot({ path: `${dir}/incoming-${ts}.png` });
+
+      const dump = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button, [role="button"]'))
+          .filter((b) => (b as HTMLElement).offsetParent !== null)
+          .slice(0, 40)
+          .map((b) => ({
+            testid: b.getAttribute('gv-test-id'),
+            aria: b.getAttribute('aria-label'),
+            text: (b.textContent || '').trim().slice(0, 30),
+          }));
+        const callEl =
+          document.querySelector('div[gv-test-id="incoming-call"]') ||
+          document.querySelector('[class*="active-call-wrapper"]');
+        return {
+          buttons,
+          callHtml: callEl ? (callEl as HTMLElement).outerHTML.slice(0, 3000) : null,
+        };
+      });
+      fs.writeFileSync(`${dir}/incoming-${ts}.json`, JSON.stringify(dump, null, 2));
+      logger.info(`Call UI dumped to ${dir}/incoming-${ts}.{png,json}`);
+    } catch (err) {
+      logger.warn(`Call UI dump failed: ${(err as Error).message}`);
+    }
   }
 
   async declineCall(page: Page, logger: Logger): Promise<void> {
