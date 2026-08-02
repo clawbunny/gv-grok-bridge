@@ -74,7 +74,7 @@ export class GoogleVoiceProvider implements VoiceProvider {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click({ timeout: 5000 });
+          await locator.click({ timeout: 5000, force: true });
           logger.info('Clicked answer button (primary selector)');
           return;
         }
@@ -94,7 +94,7 @@ export class GoogleVoiceProvider implements VoiceProvider {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click({ timeout: 5000 });
+          await locator.click({ timeout: 5000, force: true });
           logger.info('Clicked answer button (fallback selector)');
           return;
         }
@@ -114,7 +114,7 @@ export class GoogleVoiceProvider implements VoiceProvider {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click({ timeout: 5000 });
+          await locator.click({ timeout: 5000, force: true });
           logger.info('Clicked decline button (primary selector)');
           return;
         }
@@ -134,7 +134,7 @@ export class GoogleVoiceProvider implements VoiceProvider {
       try {
         const locator = page.locator(selector).first();
         if ((await locator.count()) > 0) {
-          await locator.click({ timeout: 5000 });
+          await locator.click({ timeout: 5000, force: true });
           logger.info('Clicked decline button (fallback selector)');
           return;
         }
