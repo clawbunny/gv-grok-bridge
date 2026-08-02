@@ -350,6 +350,13 @@ export class BridgeOrchestrator {
       this.audioPipeline.startEventRouter(() => this.assertAudioRouting());
       this.startAudioSampling();
 
+      // The call may have ended while activation/verification was in flight
+      // (e.g. caller gave up) — never enter BRIDGED for a dead call.
+      if (!this.status.inCall) {
+        this.logger.info('Call ended during AI activation — skipping BRIDGED');
+        return;
+      }
+
       if (activated) {
         this.transition('BRIDGED');
       } else {

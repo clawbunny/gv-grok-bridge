@@ -66,6 +66,7 @@ export class GoogleVoiceProvider implements VoiceProvider {
   async acceptCall(page: Page, logger: Logger): Promise<void> {
     logger.info('Trying to accept call');
     await this.dumpCallUI(page, logger);
+    await this.dismissBlockingDialogs(page, logger);
 
     const selectors = [
       '[gv-test-id="in-call-pickup-call"]',
@@ -100,6 +101,43 @@ export class GoogleVoiceProvider implements VoiceProvider {
       }
     }
     throw new Error('Could not find a working answer button');
+  }
+
+  /**
+   * Dismiss modal dialogs/upsells that overlay the call UI and intercept
+   * clicks (observed in production: a "Let Gemini take notes" modal with a
+   * "Maybe later" button swallowed every answer click while the call rang
+   * through to voicemail).
+   */
+  private async dismissBlockingDialogs(page: Page, logger: Logger): Promise<void> {
+    const dismissSelectors = [
+      '[role="dialog"] button:has-text("Maybe later")',
+      'button:has-text("Maybe later")',
+      '[role="dialog"] button:has-text("No thanks")',
+      'button:has-text("No thanks")',
+      '[role="dialog"] button:has-text("Got it")',
+      'button:has-text("Got it")',
+      '[role="dialog"] button:has-text("Dismiss")',
+      '[role="dialog"] button[aria-label*="close" i]',
+    ];
+    for (let round = 0; round < 3; round++) {
+      let dismissed = false;
+      for (const sel of dismissSelectors) {
+        try {
+          const btn = page.locator(sel).first();
+          if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+            await btn.click({ timeout: 3000, force: true });
+            logger.info(`Dismissed blocking dialog via ${sel}`);
+            await page.waitForTimeout(400);
+            dismissed = true;
+            break;
+          }
+        } catch {
+          // try next selector
+        }
+      }
+      if (!dismissed) return;
+    }
   }
 
   /** Screenshot + button inventory of the call UI for post-mortem debugging. */
