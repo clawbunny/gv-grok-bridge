@@ -11,7 +11,8 @@
  * when streams appear/move, replacing the old fixed 2s/8s/10s re-fix timers.
  */
 
-import { spawn, execFile, type ChildProcess } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
+import { promises as fsp } from 'fs';
 import type { AudioDevices } from '../../types';
 import type { Logger } from '../../logger';
 import { SilentLogger } from '../../logger';
@@ -250,21 +251,44 @@ export class AudioPipeline {
   }
 
   /**
-   * Extract the application.name property from a `pactl list` detail block.
+   * Resolve the MAIN Chromium process PID for a profile dir by scanning
+   * /proc (no ps, no shell). The main process owns the audio streams
+   * (AudioServiceOutOfProcess is disabled); renderer/gpu/utility children
+   * carry --type= and are skipped.
+   * Necessary because Chromium ignores PULSE_PROP_* and always reports
+   * application.name="Chromium" for both browsers — the PID is the only
+   * reliable way to tell their streams apart.
    */
-  private appNameOf(detail: string): string | null {
-    const match = detail.match(/application\.name\s*=\s*"([^"]+)"/);
-    return match ? match[1] : null;
+  private async findMainChromiumPid(userDataDir: string): Promise<number | null> {
+    let entries: string[];
+    try {
+      entries = await fsp.readdir('/proc');
+    } catch {
+      return null;
+    }
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) continue;
+      try {
+        const cmdline = await fsp.readFile(`/proc/${entry}/cmdline`, 'utf-8');
+        if (!cmdline.includes(`user-data-dir=${userDataDir}`)) continue;
+        if (cmdline.includes('--type=')) continue;
+        return parseInt(entry, 10);
+      } catch {
+        continue;
+      }
+    }
+    return null;
   }
 
-  async fixStreamRouting(): Promise<void> {
+  async fixStreamRouting(voiceUserDataDir: string, aiUserDataDir: string): Promise<void> {
     const d = this.deviceNames;
-    const apps = this.appNames;
+    const voicePid = await this.findMainChromiumPid(voiceUserDataDir);
+    const aiPid = await this.findMainChromiumPid(aiUserDataDir);
     const srcAiToVoice = await this.findSourceId(d.aiSource);
     const srcVoiceToAi = await this.findSourceId(d.voiceSource);
 
-    if (!srcAiToVoice || !srcVoiceToAi) {
-      this.logger.warn('Could not find source IDs for stream routing');
+    if (!voicePid || !aiPid || !srcAiToVoice || !srcVoiceToAi) {
+      this.logger.warn('Could not find Chromium PIDs or source IDs for stream routing');
       return;
     }
 
@@ -291,20 +315,21 @@ export class AudioPipeline {
         continue;
       }
 
-      const appName = this.appNameOf(detail);
-      if (!appName) continue;
+      const pidMatch = detail.match(/application\.process\.id\s*=\s*"(\d+)"/);
+      if (!pidMatch) continue;
+      const streamPid = parseInt(pidMatch[1], 10);
 
       let targetSource: number | null = null;
-      if (appName === apps.voice && currentSource !== srcAiToVoice) {
+      if (streamPid === voicePid && currentSource !== srcAiToVoice) {
         targetSource = srcAiToVoice;
-      } else if (appName === apps.ai && currentSource !== srcVoiceToAi) {
+      } else if (streamPid === aiPid && currentSource !== srcVoiceToAi) {
         targetSource = srcVoiceToAi;
       }
 
       if (targetSource !== null) {
         try {
           await this.execPromise(`pactl move-source-output ${sourceOutputId} ${targetSource}`);
-          this.logger.info(`Moved source-output ${sourceOutputId} (${appName}) to source ${targetSource}`);
+          this.logger.info(`Moved source-output ${sourceOutputId} (PID ${streamPid}) to source ${targetSource}`);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.logger.warn(`Failed to move source-output ${sourceOutputId}: ${message}`);
@@ -313,14 +338,15 @@ export class AudioPipeline {
     }
   }
 
-  async fixSinkRouting(): Promise<void> {
+  async fixSinkRouting(voiceUserDataDir: string, aiUserDataDir: string): Promise<void> {
     const d = this.deviceNames;
-    const apps = this.appNames;
+    const voicePid = await this.findMainChromiumPid(voiceUserDataDir);
+    const aiPid = await this.findMainChromiumPid(aiUserDataDir);
     const sinkVoice = await this.findSinkId(d.voiceSink);
     const sinkAi = await this.findSinkId(d.aiSink);
 
-    if (!sinkVoice || !sinkAi) {
-      this.logger.warn('Could not find sink IDs for sink routing');
+    if (!voicePid || !aiPid || !sinkVoice || !sinkAi) {
+      this.logger.warn('Could not find Chromium PIDs or sink IDs for sink routing');
       return;
     }
 
@@ -347,20 +373,21 @@ export class AudioPipeline {
         continue;
       }
 
-      const appName = this.appNameOf(detail);
-      if (!appName) continue;
+      const pidMatch = detail.match(/application\.process\.id\s*=\s*"(\d+)"/);
+      if (!pidMatch) continue;
+      const streamPid = parseInt(pidMatch[1], 10);
 
       let targetSink: number | null = null;
-      if (appName === apps.voice && currentSink !== sinkVoice) {
+      if (streamPid === voicePid && currentSink !== sinkVoice) {
         targetSink = sinkVoice;
-      } else if (appName === apps.ai && currentSink !== sinkAi) {
+      } else if (streamPid === aiPid && currentSink !== sinkAi) {
         targetSink = sinkAi;
       }
 
       if (targetSink !== null) {
         try {
           await this.execPromise(`pactl move-sink-input ${sinkInputId} ${targetSink}`);
-          this.logger.info(`Moved sink-input ${sinkInputId} (${appName}) to sink ${targetSink}`);
+          this.logger.info(`Moved sink-input ${sinkInputId} (PID ${streamPid}) to sink ${targetSink}`);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.logger.warn(`Failed to move sink-input ${sinkInputId}: ${message}`);

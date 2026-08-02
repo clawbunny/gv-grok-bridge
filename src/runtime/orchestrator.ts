@@ -543,10 +543,12 @@ export class BridgeOrchestrator {
   // ─── Audio routing + sampling ────────────────────────────
 
   private assertAudioRouting(): void {
-    this.audioPipeline.fixStreamRouting().catch((err) =>
+    const voiceDir = this.config.defaultProfilePath;
+    const aiDir = this.config.tempProfilePath;
+    this.audioPipeline.fixStreamRouting(voiceDir, aiDir).catch((err) =>
       this.logger.error('Audio routing fix failed', { error: (err as Error).message }),
     );
-    this.audioPipeline.fixSinkRouting().catch((err) =>
+    this.audioPipeline.fixSinkRouting(voiceDir, aiDir).catch((err) =>
       this.logger.error('Audio sink routing fix failed', { error: (err as Error).message }),
     );
   }
