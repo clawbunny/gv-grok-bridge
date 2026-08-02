@@ -76,12 +76,14 @@ export interface CallInfo {
   timestamp: Date;
 }
 
-export type VoiceEvent = 'incomingCall' | 'callAccepted' | 'callEnded' | 'error';
+export type VoiceEvent = 'incomingCall' | 'callAccepted' | 'callEnded' | 'acceptFailed' | 'pollTimeout' | 'error';
 
 export type VoiceEventHandler = {
   incomingCall: (call: CallInfo) => void;
   callAccepted: (call: CallInfo) => void;
   callEnded: () => void;
+  acceptFailed: (call: CallInfo) => void;
+  pollTimeout: (err: Error) => void;
   error: (err: Error) => void;
 };
 
@@ -118,8 +120,17 @@ export interface BridgeConfig {
   voiceProvider: ProviderRef;
   /** AI provider reference */
   aiProvider: ProviderRef;
-  /** Hours between prophylactic provider-page reloads (default: 6) */
+  /**
+   * DEPRECATED — page reloads are now health-triggered, not scheduled.
+   * Kept for config backward compatibility; ignored.
+   */
   pageReloadIntervalHours?: number;
+  /** Max time (ms) to wait for the accept-click to complete (default: 5000) */
+  acceptTimeoutMs?: number;
+  /** Number of accept retries after the first failure (default: 1) */
+  acceptRetries?: number;
+  /** Canary self-test: treat calls from this number as end-to-end probes */
+  canaryNumber?: string;
 }
 
 export interface BridgeStatus {
@@ -140,8 +151,13 @@ export interface BridgeStatus {
   voicePageResponsive: boolean;
   /** False when the AI provider page stops answering DOM probes */
   aiPageResponsive: boolean;
-  /** ISO timestamp of the last prophylactic page reload */
+  /** ISO timestamp of the last health-triggered page refresh */
   lastPageReload?: string;
+  /** Explicit lifecycle state of the bridge state machine */
+  state?: BridgeState;
+  /** Page recycles since start (per page) */
+  voicePageRecycles?: number;
+  aiPageRecycles?: number;
 }
 
 export type BridgeState =

@@ -21,8 +21,14 @@ export interface InstanceConfig {
   logLevel: LogLevel;
   profilePath?: string;
   extraArgs?: string[];
-  /** Hours between prophylactic provider-page reloads (default: 6) */
+  /** DEPRECATED — page reloads are health-triggered now; ignored. */
   pageReloadIntervalHours?: number;
+  /** Max time (ms) to wait for the accept-click (default: 5000) */
+  acceptTimeoutMs?: number;
+  /** Accept retries after the first failure (default: 1) */
+  acceptRetries?: number;
+  /** Canary self-test: calls from this number are treated as end-to-end probes */
+  canaryNumber?: string;
 }
 
 export function createDefaultConfig(instanceId: string): InstanceConfig {
@@ -83,5 +89,8 @@ export function instanceConfigToBridgeConfig(config: InstanceConfig): import('..
     voiceProvider: config.voiceProvider,
     aiProvider: config.aiProvider,
     pageReloadIntervalHours: config.pageReloadIntervalHours,
+    acceptTimeoutMs: config.acceptTimeoutMs,
+    acceptRetries: config.acceptRetries,
+    canaryNumber: config.canaryNumber,
   };
 }

@@ -1,8 +1,17 @@
 /**
  * AudioPipeline — manages PulseAudio virtual audio devices per instance.
  * Namespaced so multiple instances can coexist without collision.
+ *
+ * Stream routing matches streams by the PulseAudio `application.name`
+ * property (set at browser launch via PULSE_PROP_application_name), not by
+ * scraping PIDs from `ps` — PIDs change on renderer restarts, the property
+ * does not.
+ *
+ * Routing is re-asserted event-driven: a `pactl subscribe` listener fires
+ * when streams appear/move, replacing the old fixed 2s/8s/10s re-fix timers.
  */
 
+import { spawn, execFile, type ChildProcess } from 'child_process';
 import type { AudioDevices } from '../../types';
 import type { Logger } from '../../logger';
 import { SilentLogger } from '../../logger';
@@ -13,10 +22,16 @@ interface ModuleDef {
   args: string;
 }
 
+/** RMS below this (int16 scale) counts as silence. */
+const SILENCE_RMS_THRESHOLD = 100;
+
 export class AudioPipeline {
   private namespace: string;
   private exec: (cmd: string) => Promise<{ stdout: string; stderr: string }>;
   private logger: Logger;
+  private routerProcess: ChildProcess | null = null;
+  private routerStopped = true;
+  private routerRestartTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     namespace: string,
@@ -39,6 +54,14 @@ export class AudioPipeline {
       aiSink: `pipe_ai_to_voice_${ns}`,
       voiceSource: `src_voice_to_ai_${ns}`,
       aiSource: `src_ai_to_voice_${ns}`,
+    };
+  }
+
+  /** PulseAudio application.name values set on each browser at launch. */
+  get appNames() {
+    return {
+      voice: `Chromium-Voice-${this.namespace}`,
+      ai: `Chromium-AI-${this.namespace}`,
     };
   }
 
@@ -194,18 +217,6 @@ export class AudioPipeline {
     }
   }
 
-  private async findChromiumPid(userDataDir: string): Promise<number | null> {
-    try {
-      const { stdout } = await this.execPromise(
-        `ps aux | grep 'chromium' | grep 'user-data-dir=${userDataDir}' | grep -v grep | awk '{print $2}' | head -1`
-      );
-      const pid = parseInt(stdout.trim(), 10);
-      return Number.isNaN(pid) ? null : pid;
-    } catch {
-      return null;
-    }
-  }
-
   private async findSourceId(name: string): Promise<number | null> {
     try {
       const { stdout } = await this.execPromise('pactl list sources short');
@@ -238,19 +249,24 @@ export class AudioPipeline {
     return null;
   }
 
-  async fixStreamRouting(voiceUserDataDir: string, aiUserDataDir: string): Promise<void> {
+  /**
+   * Extract the application.name property from a `pactl list` detail block.
+   */
+  private appNameOf(detail: string): string | null {
+    const match = detail.match(/application\.name\s*=\s*"([^"]+)"/);
+    return match ? match[1] : null;
+  }
+
+  async fixStreamRouting(): Promise<void> {
     const d = this.deviceNames;
-    const voicePid = await this.findChromiumPid(voiceUserDataDir);
-    const aiPid = await this.findChromiumPid(aiUserDataDir);
+    const apps = this.appNames;
     const srcAiToVoice = await this.findSourceId(d.aiSource);
     const srcVoiceToAi = await this.findSourceId(d.voiceSource);
 
-    if (!voicePid || !aiPid || !srcAiToVoice || !srcVoiceToAi) {
-      this.logger.warn('Could not find Chromium PIDs or source IDs for stream routing');
+    if (!srcAiToVoice || !srcVoiceToAi) {
+      this.logger.warn('Could not find source IDs for stream routing');
       return;
     }
-
-    this.logger.debug(`Routing streams: voicePid=${voicePid}, aiPid=${aiPid}, srcAiToVoice=${srcAiToVoice}, srcVoiceToAi=${srcVoiceToAi}`);
 
     let stdout: string;
     try {
@@ -265,8 +281,7 @@ export class AudioPipeline {
 
       const sourceOutputId = parseInt(parts[0], 10);
       const currentSource = parseInt(parts[1], 10);
-      const clientId = parts[2];
-      if (clientId === '-') continue;
+      if (parts[2] === '-') continue;
       if (Number.isNaN(sourceOutputId)) continue;
 
       let detail: string;
@@ -276,21 +291,20 @@ export class AudioPipeline {
         continue;
       }
 
-      const pidMatch = detail.match(/application\.process\.id\s*=\s*"(\d+)"/);
-      if (!pidMatch) continue;
-      const streamPid = parseInt(pidMatch[1], 10);
+      const appName = this.appNameOf(detail);
+      if (!appName) continue;
 
       let targetSource: number | null = null;
-      if (streamPid === voicePid && currentSource !== srcAiToVoice) {
+      if (appName === apps.voice && currentSource !== srcAiToVoice) {
         targetSource = srcAiToVoice;
-      } else if (streamPid === aiPid && currentSource !== srcVoiceToAi) {
+      } else if (appName === apps.ai && currentSource !== srcVoiceToAi) {
         targetSource = srcVoiceToAi;
       }
 
       if (targetSource !== null) {
         try {
           await this.execPromise(`pactl move-source-output ${sourceOutputId} ${targetSource}`);
-          this.logger.info(`Moved source-output ${sourceOutputId} (PID ${streamPid}) to source ${targetSource}`);
+          this.logger.info(`Moved source-output ${sourceOutputId} (${appName}) to source ${targetSource}`);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.logger.warn(`Failed to move source-output ${sourceOutputId}: ${message}`);
@@ -299,19 +313,16 @@ export class AudioPipeline {
     }
   }
 
-  async fixSinkRouting(voiceUserDataDir: string, aiUserDataDir: string): Promise<void> {
+  async fixSinkRouting(): Promise<void> {
     const d = this.deviceNames;
-    const voicePid = await this.findChromiumPid(voiceUserDataDir);
-    const aiPid = await this.findChromiumPid(aiUserDataDir);
+    const apps = this.appNames;
     const sinkVoice = await this.findSinkId(d.voiceSink);
     const sinkAi = await this.findSinkId(d.aiSink);
 
-    if (!voicePid || !aiPid || !sinkVoice || !sinkAi) {
-      this.logger.warn('Could not find Chromium PIDs or sink IDs for sink routing');
+    if (!sinkVoice || !sinkAi) {
+      this.logger.warn('Could not find sink IDs for sink routing');
       return;
     }
-
-    this.logger.debug(`Routing sinks: voicePid=${voicePid}, aiPid=${aiPid}, sinkVoice=${sinkVoice}, sinkAi=${sinkAi}`);
 
     let stdout: string;
     try {
@@ -326,8 +337,7 @@ export class AudioPipeline {
 
       const sinkInputId = parseInt(parts[0], 10);
       const currentSink = parseInt(parts[1], 10);
-      const clientId = parts[2];
-      if (clientId === '-') continue;
+      if (parts[2] === '-') continue;
       if (Number.isNaN(sinkInputId)) continue;
 
       let detail: string;
@@ -337,21 +347,20 @@ export class AudioPipeline {
         continue;
       }
 
-      const pidMatch = detail.match(/application\.process\.id\s*=\s*"(\d+)"/);
-      if (!pidMatch) continue;
-      const streamPid = parseInt(pidMatch[1], 10);
+      const appName = this.appNameOf(detail);
+      if (!appName) continue;
 
       let targetSink: number | null = null;
-      if (streamPid === voicePid && currentSink !== sinkVoice) {
+      if (appName === apps.voice && currentSink !== sinkVoice) {
         targetSink = sinkVoice;
-      } else if (streamPid === aiPid && currentSink !== sinkAi) {
+      } else if (appName === apps.ai && currentSink !== sinkAi) {
         targetSink = sinkAi;
       }
 
       if (targetSink !== null) {
         try {
           await this.execPromise(`pactl move-sink-input ${sinkInputId} ${targetSink}`);
-          this.logger.info(`Moved sink-input ${sinkInputId} (PID ${streamPid}) to sink ${targetSink}`);
+          this.logger.info(`Moved sink-input ${sinkInputId} (${appName}) to sink ${targetSink}`);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           this.logger.warn(`Failed to move sink-input ${sinkInputId}: ${message}`);
@@ -360,8 +369,128 @@ export class AudioPipeline {
     }
   }
 
+  // ─── Event-driven routing re-assertion ───────────────────
+
+  /**
+   * Start listening to PulseAudio subscription events. Whenever a sink-input
+   * or source-output appears or changes, `onStreamEvent` fires (debounced).
+   * The listener respawns automatically with backoff if pactl exits.
+   */
+  startEventRouter(onStreamEvent: () => void): void {
+    this.routerStopped = false;
+    let pending: ReturnType<typeof setTimeout> | null = null;
+    let backoffMs = 1000;
+
+    const spawnListener = () => {
+      if (this.routerStopped) return;
+      let child: ChildProcess;
+      try {
+        child = spawn('pactl', ['subscribe'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      } catch (err) {
+        this.logger.error('Failed to spawn pactl subscribe', { error: (err as Error).message });
+        this.scheduleRouterRestart(spawnListener, backoffMs);
+        backoffMs = Math.min(backoffMs * 2, 60000);
+        return;
+      }
+      this.routerProcess = child;
+
+      let buffer = '';
+      child.stdout?.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (/on (sink-input|source-output) #/.test(line)) {
+            if (pending) clearTimeout(pending);
+            pending = setTimeout(() => { pending = null; onStreamEvent(); }, 500);
+            if (pending.unref) pending.unref();
+          }
+        }
+      });
+
+      child.on('exit', (code) => {
+        this.routerProcess = null;
+        if (this.routerStopped) return;
+        this.logger.warn(`pactl subscribe exited (code ${code}) — respawning in ${backoffMs}ms`);
+        this.scheduleRouterRestart(spawnListener, backoffMs);
+        backoffMs = Math.min(backoffMs * 2, 60000);
+      });
+
+      backoffMs = 1000;
+      this.logger.debug('Audio event router started');
+    };
+
+    spawnListener();
+  }
+
+  private scheduleRouterRestart(restart: () => void, delayMs: number): void {
+    if (this.routerStopped) return;
+    this.routerRestartTimer = setTimeout(() => {
+      this.routerRestartTimer = null;
+      restart();
+    }, delayMs);
+    if (this.routerRestartTimer.unref) this.routerRestartTimer.unref();
+  }
+
+  stopEventRouter(): void {
+    this.routerStopped = true;
+    if (this.routerRestartTimer) {
+      clearTimeout(this.routerRestartTimer);
+      this.routerRestartTimer = null;
+    }
+    if (this.routerProcess) {
+      try { this.routerProcess.kill(); } catch { /* ignore */ }
+      this.routerProcess = null;
+    }
+  }
+
+  // ─── Audio level sampling (silent-call detection) ────────
+
+  /**
+   * Sample ~1.5 s of audio from the given source and return its RMS level
+   * (int16 scale, 0–32767). Returns null when sampling fails.
+   */
+  async sampleAudioLevel(sourceName: string): Promise<number | null> {
+    return new Promise((resolve) => {
+      const chunks: Buffer[] = [];
+      let child: ChildProcess;
+      try {
+        child = spawn('parec', [
+          `--device=${sourceName}`,
+          '--format=s16le',
+          '--rate=16000',
+          '--channels=1',
+          '--latency-msec=100',
+        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+      } catch {
+        resolve(null);
+        return;
+      }
+
+      const done = (value: number | null) => {
+        try { child.kill(); } catch { /* ignore */ }
+        resolve(value);
+      };
+
+      const timer = setTimeout(() => {
+        if (chunks.length === 0) { done(null); return; }
+        done(rmsOfBuffers(chunks));
+      }, 1500);
+      if (timer.unref) timer.unref();
+
+      child.stdout?.on('data', (chunk: Buffer) => chunks.push(chunk));
+      child.on('error', () => { clearTimeout(timer); done(null); });
+      child.on('exit', (code) => {
+        clearTimeout(timer);
+        if (chunks.length === 0) { done(null); return; }
+        done(rmsOfBuffers(chunks));
+      });
+    });
+  }
+
   async teardown(devices: AudioDevices): Promise<void> {
     this.logger.info('Tearing down audio pipeline');
+    this.stopEventRouter();
 
     const modules = [
       { name: 'voiceSink', id: devices.voiceSink },
@@ -383,3 +512,19 @@ export class AudioPipeline {
     this.logger.info('Audio pipeline teardown complete');
   }
 }
+
+/** Compute RMS over concatenated int16-LE PCM buffers. */
+export function rmsOfBuffers(chunks: Buffer[]): number {
+  let sumSquares = 0;
+  let count = 0;
+  for (const chunk of chunks) {
+    for (let i = 0; i + 1 < chunk.length; i += 2) {
+      const sample = chunk.readInt16LE(i);
+      sumSquares += sample * sample;
+      count++;
+    }
+  }
+  return count === 0 ? 0 : Math.sqrt(sumSquares / count);
+}
+
+export { SILENCE_RMS_THRESHOLD };

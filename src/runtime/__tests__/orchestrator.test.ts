@@ -32,6 +32,9 @@ function createMocks() {
     fixSinkRouting: jest.fn().mockResolvedValue(undefined),
     setDefaultSource: jest.fn().mockResolvedValue(undefined),
     setDefaultSink: jest.fn().mockResolvedValue(undefined),
+    startEventRouter: jest.fn(),
+    stopEventRouter: jest.fn(),
+    sampleAudioLevel: jest.fn().mockResolvedValue(null),
     deviceNames: {
       voiceSink: 'pipe_voice_to_ai',
       aiSink: 'pipe_ai_to_voice',
@@ -66,12 +69,17 @@ function createMocks() {
     healthCheck: jest.fn().mockResolvedValue(true),
     getPair: jest.fn().mockReturnValue(fakePair),
     getCDPSession: jest.fn().mockResolvedValue(null),
+    recyclePage: jest.fn().mockImplementation((role: 'voice' | 'ai') =>
+      Promise.resolve(role === 'voice' ? mockVoicePage : mockAIPage)),
+    getOpenWebSocketCount: jest.fn().mockReturnValue(1),
   } as unknown as jest.Mocked<BrowserManager>;
 
   const eventHandlers: Record<string, Function[]> = {
     incomingCall: [],
     callAccepted: [],
     callEnded: [],
+    acceptFailed: [],
+    pollTimeout: [],
     error: [],
   };
 
@@ -340,20 +348,26 @@ describe('BridgeOrchestrator', () => {
       exitSpy.mockRestore();
     });
 
-    it('restarts via process.exit(1) after repeated voice page probe failures', async () => {
+    it('recycles the voice page after repeated probe failures instead of restarting', async () => {
       const pair = mocks.browserManager.getPair() as any;
       pair.voicePage.evaluate.mockRejectedValue(new Error('hung'));
 
       await (orchestrator as any).runHealthTick();
       await (orchestrator as any).runHealthTick();
+      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
       expect(exitSpy).not.toHaveBeenCalled();
-      expect(orchestrator.getStatus().voicePageResponsive).toBe(true);
 
       await (orchestrator as any).runHealthTick();
-      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('voice');
+      expect(exitSpy).not.toHaveBeenCalled();
+      // monitoring restarted on the fresh page
+      expect(mocks.voiceMonitor.stopMonitoring).toHaveBeenCalled();
+      expect(mocks.voiceMonitor.startMonitoring).toHaveBeenCalledTimes(2);
+      expect(orchestrator.getStatus().voicePageResponsive).toBe(true);
+      expect(orchestrator.getStatus().voicePageRecycles).toBe(1);
     });
 
-    it('defers restart while a call is active, then restarts on call end', async () => {
+    it('does not recycle the voice page while a call is active', async () => {
       const pair = mocks.browserManager.getPair() as any;
       pair.voicePage.evaluate.mockRejectedValue(new Error('hung'));
 
@@ -367,41 +381,132 @@ describe('BridgeOrchestrator', () => {
       await (orchestrator as any).runHealthTick();
       await (orchestrator as any).runHealthTick();
       await (orchestrator as any).runHealthTick();
-      expect(exitSpy).not.toHaveBeenCalled();
+      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
       expect(orchestrator.getStatus().voicePageResponsive).toBe(false);
+    });
+
+    it('recycles the voice page when it has no open websockets while idle', async () => {
+      (mocks.browserManager.getOpenWebSocketCount as jest.Mock).mockReturnValue(0);
+
+      await (orchestrator as any).runHealthTick();
+      await (orchestrator as any).runHealthTick();
+      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
+
+      await (orchestrator as any).runHealthTick();
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('voice');
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+
+    it('recycles the voice page after repeated idle poll timeouts', async () => {
+      mocks.voiceMonitor._emit('pollTimeout', new Error('Poll cycle timed out'));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
+
+      mocks.voiceMonitor._emit('pollTimeout', new Error('Poll cycle timed out'));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('voice');
+    });
+
+    it('escalates to restart when post-recycle login check fails', async () => {
+      const pair = mocks.browserManager.getPair() as any;
+      pair.voicePage.evaluate.mockRejectedValue(new Error('hung'));
+      mocks.voiceProvider.checkLoggedIn.mockResolvedValue(false);
+
+      await (orchestrator as any).runHealthTick();
+      await (orchestrator as any).runHealthTick();
+      await (orchestrator as any).runHealthTick();
+
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('voice');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('escalates to restart when the recycle budget is exhausted', async () => {
+      const pair = mocks.browserManager.getPair() as any;
+      pair.voicePage.evaluate.mockRejectedValue(new Error('hung'));
+
+      // Each batch of 3 probe failures triggers one recycle; after 3
+      // recycles the budget is exhausted and the next one must escalate.
+      for (let round = 0; round < 4 && !exitSpy.mock.calls.length; round++) {
+        await (orchestrator as any).runHealthTick();
+        await (orchestrator as any).runHealthTick();
+        await (orchestrator as any).runHealthTick();
+        // recycle succeeds → probe failures reset; page keeps hanging
+        pair.voicePage.evaluate.mockRejectedValue(new Error('hung'));
+      }
+
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledTimes(3);
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('defers restart while a call is active, then restarts on call end', async () => {
+      (orchestrator as any).pendingRestart = 'test fatal condition';
+
+      mocks.voiceMonitor._emit('callAccepted', {
+        phoneNumber: '+15551234567',
+        callerName: 'Alice',
+        timestamp: new Date(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      await (orchestrator as any).runHealthTick();
+      expect(exitSpy).not.toHaveBeenCalled();
 
       mocks.voiceMonitor._emit('callEnded');
       await new Promise((resolve) => setTimeout(resolve, 10));
       expect(exitSpy).toHaveBeenCalledWith(1);
     });
 
-    it('reloads provider pages prophylactically when idle and interval elapsed', async () => {
-      const pair = mocks.browserManager.getPair() as any;
-      (orchestrator as any).lastReloadAt = 0;
+    it('tracks state transitions through the call lifecycle', async () => {
+      expect(orchestrator.getState()).toBe('IDLE');
 
-      await (orchestrator as any).runHealthTick();
+      mocks.voiceMonitor._emit('incomingCall', {
+        phoneNumber: '+15551234567',
+        callerName: 'Alice',
+        timestamp: new Date(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(orchestrator.getState()).toBe('INCOMING_CALL');
 
-      expect(pair.voicePage.reload).toHaveBeenCalled();
-      expect(pair.aiPage.reload).toHaveBeenCalled();
-      expect(mocks.aiController.initialize).toHaveBeenCalled();
-      expect(orchestrator.getStatus().lastPageReload).toBeDefined();
-      expect(exitSpy).not.toHaveBeenCalled();
+      mocks.voiceMonitor._emit('callAccepted', {
+        phoneNumber: '+15551234567',
+        callerName: 'Alice',
+        timestamp: new Date(),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(orchestrator.getState()).toBe('BRIDGED');
+
+      mocks.voiceMonitor._emit('callEnded');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(orchestrator.getState()).toBe('IDLE');
     });
 
-    it('does not reload pages before the interval elapses', async () => {
-      const pair = mocks.browserManager.getPair() as any;
-      await (orchestrator as any).runHealthTick();
-      expect(pair.voicePage.reload).not.toHaveBeenCalled();
-      expect(pair.aiPage.reload).not.toHaveBeenCalled();
-    });
+    it('writes a call record on acceptFailed', async () => {
+      const metricsWriter = { append: jest.fn() };
+      orchestrator = new BridgeOrchestrator(
+        defaultConfig,
+        mocks.audioPipeline as any,
+        mocks.browserManager as any,
+        mocks.voiceMonitor as any,
+        mocks.aiController as any,
+        mocks.voiceProvider as any,
+        mocks.aiProvider as any,
+        mocks.xvfbManager as any,
+        mocks.logger as any,
+        undefined,
+        metricsWriter as any,
+      );
+      await orchestrator.start();
 
-    it('escalates to restart when post-reload login check fails', async () => {
-      (orchestrator as any).lastReloadAt = 0;
-      mocks.voiceProvider.checkLoggedIn.mockResolvedValue(false);
+      const call = { phoneNumber: '+15551234567', callerName: 'Alice', timestamp: new Date() };
+      mocks.voiceMonitor._emit('incomingCall', call);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      mocks.voiceMonitor._emit('acceptFailed', call);
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
-      await (orchestrator as any).runHealthTick();
-
-      expect(exitSpy).toHaveBeenCalledWith(1);
+      expect(metricsWriter.append).toHaveBeenCalledTimes(1);
+      const record = metricsWriter.append.mock.calls[0][0];
+      expect(record.endReason).toBe('accept_failed');
+      expect(record.phoneNumber).toBe('+15551234567');
     });
   });
 });

@@ -1,23 +1,52 @@
 /**
- * BridgeOrchestrator — connects all modules and manages the call flow.
+ * BridgeOrchestrator — explicit call state machine connecting all modules.
+ *
+ * Recovery model (layered, bounded):
+ *  1. A hung Playwright op is bounded by per-op timeouts (monitor/providers).
+ *  2. A page that keeps timing out / failing probes is RECYCLED — closing the
+ *     page rejects all outstanding protocol calls and a fresh page is created.
+ *  3. If a page needs more than MAX_RECYCLES recycles inside RECYCLE_WINDOW,
+ *     the process escalates to a systemd-managed restart (idle only — a call
+ *     in progress is never interrupted by maintenance logic).
+ *
+ * Page refreshes are health-triggered (poll timeouts, DOM probe failures,
+ * WebSocket liveness), never scheduled — no more 6-hour prophylactic crash.
  */
 
-import type { BridgeConfig, BridgeStatus, CallInfo, AudioDevices, Page } from '../types';
+import { execFile } from 'child_process';
+import type { BridgeConfig, BridgeStatus, BridgeState, CallInfo, AudioDevices, Page } from '../types';
 import type { AudioPipeline } from './audio/pipeline';
-import type { BrowserManager } from './browser/manager';
-import type { VoiceMonitor } from './monitor';
+import { SILENCE_RMS_THRESHOLD } from './audio/pipeline';
+import type { BrowserManager, PageRole } from './browser/manager';
+import type { VoiceMonitor, MonitorConfig } from './monitor';
 import type { AIController } from './ai-controller';
 import type { XvfbManager } from './xvfb';
 import type { StatusFileWriter } from './status/writer';
+import { CallMetricsWriter, CallTracker, type CallEndReason } from './metrics';
 import type { VoiceProvider, AIProvider } from '../providers/contracts';
 import type { Logger } from '../logger';
 
 export { BridgeConfig, BridgeStatus };
 
-/** Number of consecutive failed DOM probes before a page is declared unresponsive. */
+/** Number of consecutive failed DOM probes before a page is recycled. */
 const PROBE_FAILURE_THRESHOLD = 3;
 /** Timeout for a single DOM probe (ms). */
 const PROBE_TIMEOUT_MS = 5000;
+/** Idle: recycle the voice page after this many consecutive poll timeouts. */
+const IDLE_TIMEOUT_RECYCLE_THRESHOLD = 2;
+/** In-call: tolerate more timeouts (audio flows independently of the DOM). */
+const INCALL_TIMEOUT_RECYCLE_THRESHOLD = 12;
+/** Recycle budget: at most this many per page within the window. */
+const MAX_RECYCLES = 3;
+const RECYCLE_WINDOW_MS = 30 * 60 * 1000;
+/** Health ticks with zero open websockets before the voice page is declared deaf. */
+const WS_DEAD_TICKS_THRESHOLD = 3;
+/** Silent-audio sampling cadence while bridged. */
+const AUDIO_SAMPLE_INTERVAL_MS = 30000;
+/** Consecutive silent samples before flagging. */
+const SILENT_SAMPLE_THRESHOLD = 2;
+/** Canary calls are hung up by the bridge after this long. */
+const CANARY_HANGUP_MS = 30000;
 
 /** Map bridge status to human-readable critical issues for the status file / CLI. */
 export function computeCriticalIssues(status: BridgeStatus): string[] {
@@ -37,12 +66,21 @@ export function computeCriticalIssues(status: BridgeStatus): string[] {
 
 export class BridgeOrchestrator {
   private status: BridgeStatus;
+  private state: BridgeState = 'INIT';
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
+  private audioSampleTimer: ReturnType<typeof setInterval> | null = null;
   private devices: AudioDevices | null = null;
+  private monitorConfig: MonitorConfig | null = null;
   private consecutiveVoiceProbeFailures = 0;
   private consecutiveAiProbeFailures = 0;
+  private consecutiveVoicePollTimeouts = 0;
+  private wsDeadTicks = 0;
+  private silentAiSamples = 0;
+  private silentCallerSamples = 0;
   private pendingRestart: string | null = null;
-  private lastReloadAt = 0;
+  private recycleTimestamps: Record<PageRole, number[]> = { voice: [], ai: [] };
+  private callTracker: CallTracker | null = null;
+  private callEndReason: CallEndReason = 'caller_ended';
 
   constructor(
     private config: BridgeConfig,
@@ -55,6 +93,7 @@ export class BridgeOrchestrator {
     private xvfbManager: XvfbManager,
     private logger: Logger,
     private statusWriter?: StatusFileWriter,
+    private metricsWriter?: CallMetricsWriter,
   ) {
     this.status = this.createDefaultStatus();
   }
@@ -65,20 +104,26 @@ export class BridgeOrchestrator {
     this.logger.info('Starting Bridge', this.config as unknown as Record<string, unknown>);
 
     try {
+      this.transition('SETUP_AUDIO');
       await this.setupAudio();
 
       if (this.config.headless) {
         await this.xvfbManager.start(this.config.displayNum || ':99');
       }
 
+      this.transition('LAUNCH_BROWSERS');
       await this.launchBrowsers();
+
+      this.transition('CHECK_LOGINS');
       await this.checkLogins();
+
       this.setupEventWiring();
       this.startHealthChecks();
 
       this.status.running = true;
-      this.lastReloadAt = Date.now();
+      this.transition('IDLE');
       this.writeStatusFile();
+      this.sdNotify('READY=1');
       this.logger.info('Bridge started successfully');
     } catch (err) {
       this.logger.error('Bridge startup failed', { error: (err as Error).message });
@@ -89,10 +134,16 @@ export class BridgeOrchestrator {
 
   async stop(): Promise<void> {
     this.logger.info('Stopping bridge...');
+    this.transition('SHUTDOWN');
 
     if (this.healthCheckTimer) {
       clearInterval(this.healthCheckTimer);
       this.healthCheckTimer = null;
+    }
+    this.stopAudioSampling();
+
+    if (this.callTracker) {
+      this.finishCallRecord('service_stop');
     }
 
     try { this.voiceMonitor.stopMonitoring(); } catch { /* ignore */ }
@@ -110,6 +161,20 @@ export class BridgeOrchestrator {
 
   getStatus(): BridgeStatus {
     return { ...this.status };
+  }
+
+  getState(): BridgeState {
+    return this.state;
+  }
+
+  // ─── State machine ───────────────────────────────────────
+
+  private transition(to: BridgeState): void {
+    if (this.state === to) return;
+    this.logger.info(`State: ${this.state} -> ${to}`);
+    this.state = to;
+    this.status.state = to;
+    this.writeStatusFile();
   }
 
   // ─── Startup helpers ─────────────────────────────────────
@@ -136,14 +201,16 @@ export class BridgeOrchestrator {
     const pair = this.browserManager.getPair();
     if (!pair) throw new Error('Browser pair not available');
 
-    const voiceConfig = {
+    this.monitorConfig = {
       authorizedNumbers: this.config.authorizedNumbers,
       authorizedNames: this.config.authorizedNames,
       autoAccept: this.config.autoAccept,
       pollInterval: this.config.pollInterval,
+      acceptTimeoutMs: this.config.acceptTimeoutMs,
+      acceptRetries: this.config.acceptRetries,
     };
 
-    await this.voiceMonitor.startMonitoring(pair.voicePage, this.voiceProvider, voiceConfig);
+    await this.voiceMonitor.startMonitoring(pair.voicePage, this.voiceProvider, this.monitorConfig);
 
     const aiLoggedIn = await this.aiController.initialize(pair.aiPage, this.aiProvider);
     const voiceLoggedIn = await this.voiceProvider.checkLoggedIn(pair.voicePage, this.logger);
@@ -186,6 +253,16 @@ export class BridgeOrchestrator {
         this.logger.error('Error in onCallEnded', { error: (err as Error).message }),
       ),
     );
+    this.voiceMonitor.on('acceptFailed', (call: CallInfo) =>
+      this.onAcceptFailed(call).catch((err) =>
+        this.logger.error('Error in onAcceptFailed', { error: (err as Error).message }),
+      ),
+    );
+    this.voiceMonitor.on('pollTimeout', () =>
+      this.onVoicePollTimeout().catch((err) =>
+        this.logger.error('Error in onVoicePollTimeout', { error: (err as Error).message }),
+      ),
+    );
     this.voiceMonitor.on('error', (err: Error) =>
       this.logger.error('Voice monitor error', { error: err.message }),
     );
@@ -195,7 +272,13 @@ export class BridgeOrchestrator {
   // ─── Call flow handlers ──────────────────────────────────
 
   private async onIncomingCall(call: CallInfo): Promise<void> {
+    this.transition('INCOMING_CALL');
     this.logger.info(`Incoming call from ${call.callerName} (${call.phoneNumber})`);
+
+    const isCanary = !!this.config.canaryNumber && call.phoneNumber === this.config.canaryNumber;
+    this.callTracker = new CallTracker(this.config.instanceId, call.phoneNumber, call.callerName, isCanary);
+    this.callEndReason = 'caller_ended';
+
     try {
       const d = this.audioPipeline.deviceNames;
       await this.audioPipeline.setDefaultSource(d.aiSource);
@@ -208,9 +291,11 @@ export class BridgeOrchestrator {
   }
 
   private async onCallAccepted(call: CallInfo): Promise<void> {
+    this.transition('ACCEPT_CALL');
     this.logger.info('Call accepted, activating AI voice mode...');
     this.status.inCall = true;
     this.status.currentCall = call;
+    this.callTracker?.markAccepted();
 
     try {
       const pair = this.browserManager.getPair();
@@ -227,6 +312,7 @@ export class BridgeOrchestrator {
         this.logger.warn('Failed to set default audio for AI browser', { error: (err as Error).message });
       }
 
+      this.transition('ACTIVATE_AI');
       const activated = await this.aiController.activateVoiceMode(pair.aiPage);
       this.status.voiceModeActive = activated;
 
@@ -240,53 +326,77 @@ export class BridgeOrchestrator {
           }
           this.status.aiVoiceUnavailable = false;
           this.status.aiVoiceStatusDetail = undefined;
+          this.callTracker?.markBridged();
         } else {
           this.status.aiVoiceUnavailable = true;
           this.status.aiVoiceStatusDetail =
             'AI voice session did not start after activation click (account may be out of voice credits)';
+          this.callEndReason = 'ai_voice_unavailable';
           this.logger.error('AI voice session verification failed', { detail: this.status.aiVoiceStatusDetail });
         }
         this.writeStatusFile();
+      } else if (activated) {
+        this.callTracker?.markBridged();
       }
 
-      setTimeout(() => {
-        this.audioPipeline.fixStreamRouting(
-          this.config.defaultProfilePath,
-          this.config.tempProfilePath,
-        ).catch((err) =>
-          this.logger.error('Audio routing fix failed', { error: (err as Error).message }),
-        );
-        this.audioPipeline.fixSinkRouting(
-          this.config.defaultProfilePath,
-          this.config.tempProfilePath,
-        ).catch((err) =>
-          this.logger.error('Audio sink routing fix failed', { error: (err as Error).message }),
-        );
-      }, 2000).unref();
+      // Assert audio routing now, then keep it asserted event-driven.
+      this.assertAudioRouting();
+      this.audioPipeline.startEventRouter(() => this.assertAudioRouting());
+      this.startAudioSampling();
 
-      setTimeout(() => {
-        this.audioPipeline.fixStreamRouting(
-          this.config.defaultProfilePath,
-          this.config.tempProfilePath,
-        ).catch((err) =>
-          this.logger.error('Audio routing fix failed', { error: (err as Error).message }),
-        );
-        this.audioPipeline.fixSinkRouting(
-          this.config.defaultProfilePath,
-          this.config.tempProfilePath,
-        ).catch((err) =>
-          this.logger.error('Audio sink routing fix failed', { error: (err as Error).message }),
-        );
-      }, 8000).unref();
+      if (activated) {
+        this.transition('BRIDGED');
+      } else {
+        this.callEndReason = 'bridge_error';
+        this.logger.error('AI voice mode activation returned false');
+        this.writeStatusFile(['ai_activation_failed: voice mode could not be activated']);
+      }
+
+      if (this.isCanaryCall()) {
+        this.scheduleCanaryHangup();
+      }
     } catch (err) {
+      this.callEndReason = 'bridge_error';
       this.logger.error('Failed to activate AI voice mode', { error: (err as Error).message });
     }
   }
 
+  private isCanaryCall(): boolean {
+    return !!this.config.canaryNumber && this.status.currentCall?.phoneNumber === this.config.canaryNumber;
+  }
+
+  private scheduleCanaryHangup(): void {
+    const timer = setTimeout(() => {
+      (async () => {
+        this.logger.info('Canary window elapsed — hanging up self-test call');
+        const tracker = this.callTracker;
+        if (tracker) {
+          const pass = !tracker.silentAiAudio && !tracker.silentCallerAudio && !this.status.aiVoiceUnavailable;
+          this.logger.info(`CANARY ${pass ? 'PASS' : 'FAIL'}`, {
+            silentAiAudio: tracker.silentAiAudio,
+            silentCallerAudio: tracker.silentCallerAudio,
+            aiVoiceUnavailable: this.status.aiVoiceUnavailable,
+          });
+          if (!pass) this.writeStatusFile(['canary_failed: audio or AI session check failed']);
+        }
+        this.callEndReason = 'canary_complete';
+        const pair = this.browserManager.getPair();
+        if (pair) {
+          try { await this.voiceProvider.declineCall(pair.voicePage, this.logger); } catch { /* best effort */ }
+        }
+      })().catch((err) => this.logger.error('Canary hangup failed', { error: (err as Error).message }));
+    }, CANARY_HANGUP_MS);
+    if (timer.unref) timer.unref();
+  }
+
   private async onCallEnded(): Promise<void> {
+    this.transition('CALL_ENDING');
     this.logger.info('Call ended, deactivating AI voice mode...');
     this.status.inCall = false;
     this.status.currentCall = undefined;
+
+    this.audioPipeline.stopEventRouter();
+    this.stopAudioSampling();
 
     try {
       const d = this.audioPipeline.deviceNames;
@@ -298,6 +408,7 @@ export class BridgeOrchestrator {
       this.logger.warn('Failed to restore default audio', { error: (err as Error).message });
     }
 
+    this.transition('DEACTIVATE_AI');
     try {
       const pair = this.browserManager.getPair();
       if (!pair) throw new Error('Browser pair not available');
@@ -308,10 +419,183 @@ export class BridgeOrchestrator {
       this.status.voiceModeActive = false;
     }
 
-    // A restart deferred while the call was active can proceed now
+    this.finishCallRecord(this.callEndReason);
+    this.transition('IDLE');
+
+    // Maintenance deferred while the call was active can proceed now
     if (this.pendingRestart) {
       await this.maybeRestart();
+    } else if (!this.status.aiPageResponsive) {
+      await this.recyclePage('ai', 'AI page unresponsive — recycling after call');
     }
+  }
+
+  private async onAcceptFailed(call: CallInfo): Promise<void> {
+    this.logger.error(`Accept failed for ${call.phoneNumber} — call was declined`, {
+      acceptTimeoutMs: this.config.acceptTimeoutMs ?? 5000,
+      acceptRetries: this.config.acceptRetries ?? 1,
+    });
+    this.finishCallRecord('accept_failed');
+    this.status.inCall = false;
+    this.status.currentCall = undefined;
+    this.writeStatusFile([`accept_failed: could not answer ${call.phoneNumber} in time`]);
+    this.transition('IDLE');
+  }
+
+  // ─── Layered recovery ────────────────────────────────────
+
+  private async onVoicePollTimeout(): Promise<void> {
+    this.consecutiveVoicePollTimeouts++;
+    const threshold = this.status.inCall
+      ? INCALL_TIMEOUT_RECYCLE_THRESHOLD
+      : IDLE_TIMEOUT_RECYCLE_THRESHOLD;
+
+    if (this.consecutiveVoicePollTimeouts < threshold) return;
+    this.consecutiveVoicePollTimeouts = 0;
+
+    if (this.status.inCall) {
+      // The page can no longer even report call state — the call is lost to
+      // us regardless; tear it down cleanly, then recover the page.
+      this.callEndReason = 'bridge_error';
+      await this.onCallEnded();
+    }
+    await this.recyclePage('voice', `voice page poll timeouts x${threshold}`);
+  }
+
+  private async recyclePage(role: PageRole, reason: string): Promise<void> {
+    if (!this.canRecycle(role)) {
+      this.pendingRestart = `${role} page recycle budget exhausted (${MAX_RECYCLES} in ${RECYCLE_WINDOW_MS / 60000}min)`;
+      this.logger.error('Recycle budget exhausted — escalating to restart', { role, reason });
+      return;
+    }
+
+    this.logger.warn(`Recycling ${role} page`, { reason });
+    try {
+      if (role === 'voice') {
+        await this.voiceMonitor.stopMonitoring();
+        const page = await this.browserManager.recyclePage('voice');
+        const loggedIn = await this.voiceProvider.checkLoggedIn(page, this.logger);
+        this.status.voiceLoggedIn = loggedIn;
+        if (!loggedIn) {
+          this.pendingRestart = 'voice provider not logged in after page recycle';
+          return;
+        }
+        if (this.monitorConfig) {
+          await this.voiceMonitor.startMonitoring(page, this.voiceProvider, this.monitorConfig);
+        }
+        this.consecutiveVoiceProbeFailures = 0;
+        this.wsDeadTicks = 0;
+        this.status.voicePageResponsive = true;
+        this.status.voicePageRecycles = (this.status.voicePageRecycles ?? 0) + 1;
+      } else {
+        const page = await this.browserManager.recyclePage('ai');
+        const loggedIn = await this.aiController.initialize(page, this.aiProvider);
+        this.status.aiLoggedIn = loggedIn;
+        if (!loggedIn) {
+          this.pendingRestart = 'AI provider not logged in after page recycle';
+          return;
+        }
+        this.consecutiveAiProbeFailures = 0;
+        this.status.aiPageResponsive = true;
+        this.status.aiPageRecycles = (this.status.aiPageRecycles ?? 0) + 1;
+        // If a call is active, try to re-establish the AI session
+        if (this.status.inCall) {
+          const reactivated = await this.aiController.activateVoiceMode(page);
+          this.status.voiceModeActive = reactivated;
+          if (reactivated && this.aiProvider.verifyVoiceSession) {
+            const verified = await this.aiProvider.verifyVoiceSession(page, this.logger);
+            this.status.aiVoiceUnavailable = !verified;
+          }
+        }
+      }
+      this.status.lastPageReload = new Date().toISOString();
+      this.writeStatusFile();
+      this.logger.info(`${role} page recycled successfully`);
+    } catch (err) {
+      this.logger.error(`Failed to recycle ${role} page`, { error: (err as Error).message });
+      this.pendingRestart = `${role} page recycle failed: ${(err as Error).message}`;
+    }
+  }
+
+  private canRecycle(role: PageRole): boolean {
+    const now = Date.now();
+    const windowStart = now - RECYCLE_WINDOW_MS;
+    this.recycleTimestamps[role] = this.recycleTimestamps[role].filter((t) => t > windowStart);
+    if (this.recycleTimestamps[role].length >= MAX_RECYCLES) return false;
+    this.recycleTimestamps[role].push(now);
+    return true;
+  }
+
+  // ─── Audio routing + sampling ────────────────────────────
+
+  private assertAudioRouting(): void {
+    this.audioPipeline.fixStreamRouting().catch((err) =>
+      this.logger.error('Audio routing fix failed', { error: (err as Error).message }),
+    );
+    this.audioPipeline.fixSinkRouting().catch((err) =>
+      this.logger.error('Audio sink routing fix failed', { error: (err as Error).message }),
+    );
+  }
+
+  private startAudioSampling(): void {
+    this.stopAudioSampling();
+    this.silentAiSamples = 0;
+    this.silentCallerSamples = 0;
+    this.audioSampleTimer = setInterval(() => {
+      this.sampleAudioDirections().catch((err) =>
+        this.logger.warn('Audio sampling failed', { error: (err as Error).message }),
+      );
+    }, AUDIO_SAMPLE_INTERVAL_MS);
+    if (this.audioSampleTimer.unref) this.audioSampleTimer.unref();
+  }
+
+  private stopAudioSampling(): void {
+    if (this.audioSampleTimer) {
+      clearInterval(this.audioSampleTimer);
+      this.audioSampleTimer = null;
+    }
+  }
+
+  private async sampleAudioDirections(): Promise<void> {
+    if (!this.status.inCall || !this.callTracker) return;
+    const d = this.audioPipeline.deviceNames;
+
+    // caller→AI direction: voice browser output (monitored by voiceSource)
+    const callerLevel = await this.audioPipeline.sampleAudioLevel(d.voiceSource);
+    // AI→caller direction: AI browser output (monitored by aiSource)
+    const aiLevel = await this.audioPipeline.sampleAudioLevel(d.aiSource);
+
+    if (callerLevel !== null && callerLevel < SILENCE_RMS_THRESHOLD) this.silentCallerSamples++;
+    else this.silentCallerSamples = 0;
+    if (aiLevel !== null && aiLevel < SILENCE_RMS_THRESHOLD) this.silentAiSamples++;
+    else this.silentAiSamples = 0;
+
+    this.logger.debug('Audio levels sampled', { callerLevel, aiLevel });
+
+    if (this.silentCallerSamples >= SILENT_SAMPLE_THRESHOLD && this.callTracker) {
+      this.callTracker.silentCallerAudio = true;
+    }
+    if (this.silentAiSamples >= SILENT_SAMPLE_THRESHOLD && this.callTracker) {
+      this.callTracker.silentAiAudio = true;
+      this.logger.error('Silent AI audio detected — caller likely hears nothing', { aiLevel });
+      this.writeStatusFile(['silent_ai_audio: no audio from AI to caller direction']);
+    }
+  }
+
+  private finishCallRecord(reason: CallEndReason): void {
+    if (!this.callTracker || !this.metricsWriter) {
+      this.callTracker = null;
+      return;
+    }
+    const record = this.callTracker.finish(reason);
+    this.metricsWriter.append(record);
+    this.logger.info('Call record written', {
+      phoneNumber: record.phoneNumber,
+      endReason: reason,
+      acceptLatencyMs: record.acceptLatencyMs,
+      durationMs: record.durationMs,
+    });
+    this.callTracker = null;
   }
 
   // ─── Health checks ───────────────────────────────────────
@@ -338,23 +622,43 @@ export class BridgeOrchestrator {
     // DOM probes — detect pages that are hung or otherwise unresponsive
     await this.probePages();
 
-    if (this.status.inCall) {
-      await this.audioPipeline.fixStreamRouting(
-        this.config.defaultProfilePath,
-        this.config.tempProfilePath,
-      );
-      await this.audioPipeline.fixSinkRouting(
-        this.config.defaultProfilePath,
-        this.config.tempProfilePath,
-      );
+    // Recycle pages that have proven unresponsive (idle only for voice;
+    // AI page recycle during a call re-establishes the session)
+    if (this.consecutiveVoiceProbeFailures >= PROBE_FAILURE_THRESHOLD) {
+      if (this.status.inCall) {
+        this.logger.warn('Voice page unresponsive but call active — poll timeout path will bound it');
+      } else {
+        await this.recyclePage('voice', 'voice page unresponsive (consecutive probe failures)');
+      }
+    }
+    if (this.consecutiveAiProbeFailures >= PROBE_FAILURE_THRESHOLD) {
+      if (this.status.inCall) {
+        this.logger.warn('AI page unresponsive during call — will recycle after call ends');
+      } else {
+        await this.recyclePage('ai', 'AI page unresponsive (consecutive probe failures)');
+      }
     }
 
-    // Prophylactic reload of provider pages (idle only) — prevents
-    // long-lived pages from silently losing their backend connection
-    await this.maybeReloadPages();
+    // WebSocket liveness — a Google Voice page with no open websockets is
+    // deaf: it will never show an incoming call. Idle only.
+    if (!this.status.inCall && this.status.running) {
+      const openWs = this.browserManager.getOpenWebSocketCount('voice');
+      if (openWs === 0) {
+        this.wsDeadTicks++;
+        if (this.wsDeadTicks >= WS_DEAD_TICKS_THRESHOLD) {
+          this.wsDeadTicks = 0;
+          await this.recyclePage('voice', 'voice page has no open websockets (backend connection lost)');
+        }
+      } else {
+        this.wsDeadTicks = 0;
+      }
+    }
 
     // Persist status for CLI inspection (voicebridge status <id>)
     this.writeStatusFile();
+
+    // Feed the systemd watchdog every healthy tick
+    this.sdNotify('WATCHDOG=1');
 
     // Escalate unrecoverable states to a systemd-managed restart
     await this.maybeRestart();
@@ -396,45 +700,7 @@ export class BridgeOrchestrator {
     }
   }
 
-  private async maybeReloadPages(): Promise<void> {
-    if (this.status.inCall) return;
-    const intervalMs = (this.config.pageReloadIntervalHours ?? 6) * 3600 * 1000;
-    if (Date.now() - this.lastReloadAt < intervalMs) return;
-
-    const pair = this.browserManager.getPair();
-    if (!pair) return;
-
-    this.logger.info('Prophylactic provider page reload starting');
-    try {
-      await pair.voicePage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-      const voiceLoggedIn = await this.voiceProvider.checkLoggedIn(pair.voicePage, this.logger);
-      this.status.voiceLoggedIn = voiceLoggedIn;
-      if (!voiceLoggedIn) throw new Error('voice provider not logged in after page reload');
-
-      await pair.aiPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
-      const aiLoggedIn = await this.aiController.initialize(pair.aiPage, this.aiProvider);
-      this.status.aiLoggedIn = aiLoggedIn;
-      if (!aiLoggedIn) throw new Error('AI provider not logged in after page reload');
-
-      this.lastReloadAt = Date.now();
-      this.status.lastPageReload = new Date(this.lastReloadAt).toISOString();
-      this.consecutiveVoiceProbeFailures = 0;
-      this.consecutiveAiProbeFailures = 0;
-      this.logger.info('Prophylactic provider page reload complete');
-    } catch (err) {
-      this.logger.error('Prophylactic page reload failed', { error: (err as Error).message });
-      this.pendingRestart = `page reload failed: ${(err as Error).message}`;
-    }
-  }
-
   private async maybeRestart(): Promise<void> {
-    if (!this.pendingRestart) {
-      if (this.consecutiveVoiceProbeFailures >= PROBE_FAILURE_THRESHOLD) {
-        this.pendingRestart = 'voice page unresponsive (consecutive probe failures)';
-      } else if (this.consecutiveAiProbeFailures >= PROBE_FAILURE_THRESHOLD) {
-        this.pendingRestart = 'AI page unresponsive (consecutive probe failures)';
-      }
-    }
     if (!this.pendingRestart) return;
 
     if (this.status.inCall) {
@@ -454,6 +720,12 @@ export class BridgeOrchestrator {
     this.statusWriter.write(this.getStatus(), [...computeCriticalIssues(this.status), ...extraIssues]);
   }
 
+  /** Best-effort sd_notify; no-op when not running under systemd. */
+  private sdNotify(message: string): void {
+    if (!process.env.NOTIFY_SOCKET) return;
+    execFile('systemd-notify', [message], () => { /* best effort */ });
+  }
+
   // ─── Status helpers ──────────────────────────────────────
 
   private createDefaultStatus(): BridgeStatus {
@@ -469,6 +741,9 @@ export class BridgeOrchestrator {
       aiVoiceUnavailable: false,
       voicePageResponsive: true,
       aiPageResponsive: true,
+      state: this.state,
+      voicePageRecycles: 0,
+      aiPageRecycles: 0,
     };
   }
 }

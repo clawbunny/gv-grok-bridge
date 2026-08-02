@@ -107,14 +107,18 @@ describe('GrokProvider', () => {
       expect(result).toBe(false);
     });
 
-    it('returns true when logged-in greeting text is detected', async () => {
+    it('returns false when no decisive signal appears (greeting text is not proof)', async () => {
+      // Regression guard: the old heuristic treated greeting text like
+      // "Good morning" as logged-in, which false-positived on the public
+      // landing page and raced page init after reloads. Only a visible
+      // composer counts as logged in now.
       const page = createMockPage({
         loginVisible: false,
         chatInputVisible: false,
         bodyText: 'Good morning',
       });
       const result = await provider.checkLoggedIn(page, silentLogger as any);
-      expect(result).toBe(true);
+      expect(result).toBe(false);
     });
   });
 
@@ -198,6 +202,36 @@ describe('GrokProvider', () => {
 
     it('returns true when a voice-session indicator is visible', async () => {
       const page = createVerifyMockPage({ activeIndicatorVisible: true });
+      const result = await provider.verifyVoiceSession(page, silentLogger as any);
+      expect(result).toBe(true);
+    });
+
+    it('returns true when RTC hooks report a live audio track', async () => {
+      const page = {
+        waitForTimeout: jest.fn().mockResolvedValue(undefined),
+        evaluate: jest.fn().mockResolvedValue({ liveAudioTrack: true, connectedPeer: false }),
+        locator: jest.fn().mockImplementation(() => ({
+          count: jest.fn().mockResolvedValue(0),
+          first: jest.fn().mockReturnThis(),
+          isVisible: jest.fn().mockResolvedValue(false),
+          textContent: jest.fn().mockResolvedValue(''),
+        })),
+      } as any;
+      const result = await provider.verifyVoiceSession(page, silentLogger as any);
+      expect(result).toBe(true);
+    });
+
+    it('returns true when RTC hooks report a connected peer', async () => {
+      const page = {
+        waitForTimeout: jest.fn().mockResolvedValue(undefined),
+        evaluate: jest.fn().mockResolvedValue({ liveAudioTrack: false, connectedPeer: true }),
+        locator: jest.fn().mockImplementation(() => ({
+          count: jest.fn().mockResolvedValue(0),
+          first: jest.fn().mockReturnThis(),
+          isVisible: jest.fn().mockResolvedValue(false),
+          textContent: jest.fn().mockResolvedValue(''),
+        })),
+      } as any;
       const result = await provider.verifyVoiceSession(page, silentLogger as any);
       expect(result).toBe(true);
     });

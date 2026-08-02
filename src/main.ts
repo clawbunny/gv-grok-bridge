@@ -20,10 +20,11 @@ import { AIController } from './runtime/ai-controller';
 import { XvfbManager } from './runtime/xvfb';
 import { BridgeOrchestrator } from './runtime/orchestrator';
 import { StatusFileWriter } from './runtime/status/writer';
+import { CallMetricsWriter } from './runtime/metrics';
 import { getVoiceProvider, getAIProvider } from './providers';
 import { loadInstance } from './instance/registry';
 import { instanceConfigToBridgeConfig, type InstanceConfig } from './instance/config';
-import { getInstanceConfigPath, getInstanceStatusPath } from './instance/paths';
+import { getInstanceConfigPath, getInstanceStatusPath, getInstanceCallsPath } from './instance/paths';
 
 const execAsync = promisify(exec);
 
@@ -122,6 +123,7 @@ async function main(): Promise<void> {
   const aiController = new AIController(logger);
   const xvfbManager = new XvfbManager(logger);
   const statusWriter = new StatusFileWriter(getInstanceStatusPath(instanceId));
+  const metricsWriter = new CallMetricsWriter(getInstanceCallsPath(instanceId));
 
   const bridge = new BridgeOrchestrator(
     config,
@@ -134,6 +136,7 @@ async function main(): Promise<void> {
     xvfbManager,
     logger,
     statusWriter,
+    metricsWriter,
   );
 
   // ── Graceful shutdown ──────────────────────────────

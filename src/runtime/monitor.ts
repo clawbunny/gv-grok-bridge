@@ -1,6 +1,15 @@
 /**
  * Generic Voice Monitor — delegates all provider-specific logic to a VoiceProvider.
  * Handles polling, authorization, and event emission.
+ *
+ * Stability contract:
+ * - Every poll cycle is bounded by `pollTimeout` (mutex is always released).
+ * - Call acceptance is bounded by `acceptTimeoutMs`, retried `acceptRetries`
+ *   times, and the call is declined + `acceptFailed` emitted when acceptance
+ *   cannot be confirmed — a caller must never ring forever while we hang.
+ * - Hung provider operations cannot be cancelled by Promise.race alone; the
+ *   monitor emits `pollTimeout` so the orchestrator can recycle the page
+ *   (closing the page rejects all outstanding Playwright calls).
  */
 
 import type { Page } from 'playwright';
@@ -17,7 +26,20 @@ export interface MonitorConfig {
   pollInterval?: number;
   /** Maximum time (ms) a single poll iteration may run before it is aborted. */
   pollTimeout?: number;
+  /** Maximum time (ms) to wait for the accept-click to complete. */
+  acceptTimeoutMs?: number;
+  /** Number of accept retries after the first failure. */
+  acceptRetries?: number;
 }
+
+const VOICE_EVENTS: VoiceEvent[] = [
+  'incomingCall',
+  'callAccepted',
+  'callEnded',
+  'acceptFailed',
+  'pollTimeout',
+  'error',
+];
 
 export class VoiceMonitor {
   private inCall: boolean;
@@ -26,7 +48,7 @@ export class VoiceMonitor {
   private pollTimer: ReturnType<typeof setInterval> | null;
   private handlers: Map<VoiceEvent, Function[]>;
   private page: Page | null;
-  private config: MonitorConfig | null;
+  private config: Required<MonitorConfig> | null;
   private pollMutex: boolean;
   private logger: Logger;
   private provider: VoiceProvider | null;
@@ -42,7 +64,7 @@ export class VoiceMonitor {
     this.pollMutex = false;
     this.logger = logger;
     this.provider = null;
-    for (const event of ['incomingCall', 'callAccepted', 'callEnded', 'error'] as VoiceEvent[]) {
+    for (const event of VOICE_EVENTS) {
       this.handlers.set(event, []);
     }
   }
@@ -59,11 +81,18 @@ export class VoiceMonitor {
     if (this.polling) throw new Error('Monitoring is already active');
     this.page = page;
     this.provider = provider;
-    this.config = { pollInterval: 1000, pollTimeout: 15000, ...config };
+    this.config = {
+      pollInterval: 1000,
+      pollTimeout: 15000,
+      acceptTimeoutMs: 5000,
+      acceptRetries: 1,
+      authorizedNames: [],
+      ...config,
+    };
     this.polling = true;
     this.inCall = false;
     this.currentCall = null;
-    const interval = this.config.pollInterval ?? 1000;
+    const interval = this.config.pollInterval;
     this.logger.info(`Started monitoring (interval: ${interval}ms)`);
     await this.poll();
     this.pollTimer = setInterval(() => {
@@ -89,17 +118,23 @@ export class VoiceMonitor {
   private async poll(): Promise<void> {
     if (this.pollMutex || !this.polling || !this.page || !this.provider || !this.config) return;
     this.pollMutex = true;
-    const timeoutMs = this.config.pollTimeout ?? 15000;
+    const timeoutMs = this.config.pollTimeout;
+    let timedOut = false;
     try {
       await Promise.race([
         this.runPollCycle(),
         new Promise<void>((_, reject) => {
-          setTimeout(() => reject(new Error(`Poll cycle timed out after ${timeoutMs}ms`)), timeoutMs);
+          const t = setTimeout(() => {
+            timedOut = true;
+            reject(new Error(`Poll cycle timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+          (t as { unref?: () => void }).unref?.();
         }),
       ]);
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       this.logger.error('Error during poll', { message: error.message });
+      if (timedOut) this.emit('pollTimeout', error);
       this.emit('error', error);
     } finally {
       this.pollMutex = false;
@@ -117,10 +152,7 @@ export class VoiceMonitor {
         if (isAuthorized(callInfo, this.config.authorizedNumbers, this.config.authorizedNames)) {
           this.logger.info(`ALLOWED — ${callInfo.phoneNumber} is authorized`);
           if (this.config.autoAccept) {
-            await this.provider.acceptCall(this.page, this.logger);
-            this.inCall = true;
-            this.emit('callAccepted', callInfo);
-            this.logger.info(`Call accepted from ${callInfo.phoneNumber}`);
+            await this.acceptWithRetry(callInfo);
           }
         } else {
           this.logger.info(`DENIED — ${callInfo.phoneNumber} is NOT authorized`);
@@ -137,6 +169,54 @@ export class VoiceMonitor {
         this.emit('callEnded');
       }
     }
+  }
+
+  /**
+   * Accept the incoming call with a hard per-attempt timeout. If acceptance
+   * cannot be confirmed after all retries, decline the call so the caller is
+   * not left ringing, and emit `acceptFailed` for alerting.
+   */
+  private async acceptWithRetry(callInfo: CallInfo): Promise<void> {
+    if (!this.page || !this.provider || !this.config) return;
+    const attempts = 1 + this.config.acceptRetries;
+
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        await this.withTimeout(
+          this.provider.acceptCall(this.page, this.logger),
+          this.config.acceptTimeoutMs,
+          `acceptCall timed out after ${this.config.acceptTimeoutMs}ms`,
+        );
+        this.inCall = true;
+        this.emit('callAccepted', callInfo);
+        this.logger.info(`Call accepted from ${callInfo.phoneNumber} (attempt ${attempt})`);
+        return;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        this.logger.error(`acceptCall failed (attempt ${attempt}/${attempts})`, { message: error.message });
+      }
+    }
+
+    this.logger.error(`Accept failed for ${callInfo.phoneNumber} — declining call`);
+    try {
+      await this.withTimeout(
+        this.provider.declineCall(this.page, this.logger),
+        this.config.acceptTimeoutMs,
+        'declineCall timed out',
+      );
+    } catch { /* best effort — caller will reach voicemail */ }
+    this.currentCall = null;
+    this.emit('acceptFailed', callInfo);
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    return Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        const t = setTimeout(() => reject(new Error(message)), timeoutMs);
+        (t as { unref?: () => void }).unref?.();
+      }),
+    ]);
   }
 
   private emit(event: VoiceEvent, ...args: any[]): void {

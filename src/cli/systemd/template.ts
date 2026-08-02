@@ -4,12 +4,11 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { getInstanceServicePath, getInstanceConfigPath, getInstanceDataDir, getInstanceLogPath } from '../../instance/paths';
+import { getInstanceServicePath, getInstanceConfigPath, getInstanceDataDir } from '../../instance/paths';
 
 export function generateServiceFile(instanceId: string): string {
   const configPath = getInstanceConfigPath(instanceId);
   const dataDir = getInstanceDataDir(instanceId);
-  const logPath = getInstanceLogPath(instanceId);
 
   return `[Unit]
 Description=GV Bridge Instance: ${instanceId}
@@ -33,8 +32,13 @@ Restart=on-failure
 RestartSec=60
 StartLimitIntervalSec=300
 StartLimitBurst=5
-StandardOutput=append:${logPath}
-StandardError=append:${logPath}
+# The bridge pings the watchdog on every healthy 10s health tick;
+# if the process is alive but wedged, systemd restarts it.
+WatchdogSec=45
+# Logs go to the journal (auto-rotated, size-capped) — query with:
+#   journalctl --user -u gv-bridge-${instanceId} -f
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

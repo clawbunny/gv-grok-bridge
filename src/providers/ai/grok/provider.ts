@@ -35,64 +35,50 @@ export class GrokProvider implements AIProvider {
         await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       }
 
-      await page.waitForTimeout(10000);
-      const url = page.url();
-
-      const loginSelectors = [
+      // Condition-based wait: poll until either a logged-in signal (chat
+      // composer) or a logged-out signal (login button / auth redirect)
+      // appears. No fixed sleeps — the first decisive signal wins.
+      const composerSelector = [
+        'textarea',
+        'div[contenteditable="true"]',
+        '[data-testid="message-input"]',
+        'div[role="textbox"]',
+      ].join(', ');
+      const loginSelector = [
         'button:has-text("Log in")',
         'button:has-text("Sign in")',
         'a:has-text("Log in")',
         'a:has-text("Sign in")',
         '[data-testid="login-button"]',
         'button[aria-label*="login" i]',
-      ];
-      for (const sel of loginSelectors) {
-        const btn = page.locator(sel).first();
-        if ((await btn.count()) > 0) {
-          const visible = await btn.isVisible().catch(() => false);
-          if (visible) {
-            logger.debug('Login button found on grok.com');
-            return false;
-          }
-        }
-      }
+      ].join(', ');
 
-      const chatSelectors = [
-        'textarea',
-        'div[contenteditable="true"]',
-        '[data-testid="message-input"]',
-        'input[placeholder*="Ask" i]',
-        'input[placeholder*="help you" i]',
-        'input[placeholder*="Message" i]',
-        'div[role="textbox"]',
-        'input[type="text"]',
-        'input:not([type])',
-      ];
-      for (const sel of chatSelectors) {
-        const input = page.locator(sel).first();
-        if ((await input.count()) > 0) {
-          logger.debug('Chat input found on grok.com');
+      const deadline = Date.now() + 30000;
+      let iterations = 0;
+      while (Date.now() < deadline && iterations < 45) {
+        iterations++;
+        const url = page.url();
+        if (url.includes('login') || url.includes('signin') || url.includes('auth')) {
+          logger.debug('Redirected to login/auth page');
+          return false;
+        }
+
+        const loginBtn = page.locator(loginSelector).first();
+        if ((await loginBtn.count()) > 0 && (await loginBtn.isVisible().catch(() => false))) {
+          logger.debug('Login button found on grok.com');
+          return false;
+        }
+
+        const composer = page.locator(composerSelector).first();
+        if ((await composer.count()) > 0 && (await composer.isVisible().catch(() => false))) {
+          logger.debug('Chat composer found on grok.com');
           return true;
         }
+
+        await page.waitForTimeout(1000);
       }
 
-      if (url.includes('login') || url.includes('signin') || url.includes('auth')) {
-        logger.debug('Redirected to login/auth page');
-        return false;
-      }
-
-      const bodyText = (await page.locator('body').textContent().catch(() => '')) || '';
-      if (
-        bodyText.includes('Good morning') ||
-        bodyText.includes('Good afternoon') ||
-        bodyText.includes('What do you want to know') ||
-        bodyText.includes('How can I help')
-      ) {
-        logger.debug('Logged-in greeting text detected');
-        return true;
-      }
-
-      logger.debug('No clear login state detected, assuming not logged in');
+      logger.warn('No decisive login signal within 30s, assuming not logged in');
       return false;
     } catch (err) {
       logger.error('Error checking login state', { error: (err as Error).message });
@@ -194,6 +180,29 @@ export class GrokProvider implements AIProvider {
     try {
       // Give the page a moment to react to the activation click
       await page.waitForTimeout(4000);
+
+      // 1. Deterministic check via RTC hooks (installed by BrowserManager's
+      //    init script): a live audio track or a connected RTCPeerConnection
+      //    proves a voice session regardless of DOM cosmetics.
+      try {
+        const rtcState = await page.evaluate(() => {
+          const hooks = (window as any).__rtcHooks;
+          if (!hooks) return null;
+          const liveAudioTrack = (hooks.streams as MediaStream[]).some(
+            (s) => s.active && s.getAudioTracks().some((t) => t.enabled && t.readyState === 'live'),
+          );
+          const connectedPeer = (hooks.peers as RTCPeerConnection[]).some(
+            (pc) => pc.connectionState === 'connected',
+          );
+          return { liveAudioTrack, connectedPeer };
+        });
+        if (rtcState?.liveAudioTrack || rtcState?.connectedPeer) {
+          logger.info('Voice session verified via RTC hooks', rtcState);
+          return true;
+        }
+      } catch {
+        // hooks unavailable (older page) — fall through to DOM checks
+      }
 
       const quotaPattern = /upgrade|subscribe|super ?grok|credit|limit reached|try again later|unavailable/i;
 

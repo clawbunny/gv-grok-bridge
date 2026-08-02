@@ -120,6 +120,77 @@ describe('VoiceMonitor', () => {
       expect(monitor.isInCall()).toBe(false);
     });
 
+    it('retries accept once then declines and emits acceptFailed when acceptCall keeps failing', async () => {
+      jest.useRealTimers();
+      const call: CallInfo = { phoneNumber: '+14085506532', callerName: 'Alice', timestamp: new Date() };
+      const provider = createMockProvider({
+        detectIncomingCall: jest.fn().mockResolvedValue(call),
+        acceptCall: jest.fn().mockRejectedValue(new Error('click hung')),
+        declineCall: jest.fn().mockResolvedValue(undefined),
+      });
+      const acceptFailedHandler = jest.fn();
+      monitor.on('acceptFailed', acceptFailedHandler);
+
+      await monitor.startMonitoring(createMockPage(), provider, {
+        authorizedNumbers: ['+14085506532'],
+        autoAccept: true,
+        pollInterval: 1000,
+        acceptTimeoutMs: 100,
+        acceptRetries: 1,
+      });
+
+      // initial try + one retry, then decline — caller must not ring forever
+      expect(provider.acceptCall).toHaveBeenCalledTimes(2);
+      expect(provider.declineCall).toHaveBeenCalled();
+      expect(acceptFailedHandler).toHaveBeenCalledWith(call);
+      expect(monitor.isInCall()).toBe(false);
+    });
+
+    it('bounds acceptCall duration with acceptTimeoutMs', async () => {
+      jest.useRealTimers();
+      const call: CallInfo = { phoneNumber: '+14085506532', callerName: 'Alice', timestamp: new Date() };
+      const provider = createMockProvider({
+        detectIncomingCall: jest.fn().mockResolvedValue(call),
+        // accept hangs forever — the timeout must cut it off
+        acceptCall: jest.fn().mockImplementation(() => new Promise(() => {})),
+        declineCall: jest.fn().mockResolvedValue(undefined),
+      });
+      const acceptFailedHandler = jest.fn();
+      monitor.on('acceptFailed', acceptFailedHandler);
+
+      const started = Date.now();
+      await monitor.startMonitoring(createMockPage(), provider, {
+        authorizedNumbers: ['+14085506532'],
+        autoAccept: true,
+        pollInterval: 1000,
+        acceptTimeoutMs: 200,
+        acceptRetries: 0,
+      });
+
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(provider.declineCall).toHaveBeenCalled();
+      expect(acceptFailedHandler).toHaveBeenCalledWith(call);
+    });
+
+    it('emits pollTimeout distinctly from generic errors', async () => {
+      jest.useRealTimers();
+      const provider = createMockProvider({
+        detectIncomingCall: jest.fn().mockImplementation(() => new Promise(() => {})),
+      });
+      const timeoutHandler = jest.fn();
+      monitor.on('pollTimeout', timeoutHandler);
+
+      await monitor.startMonitoring(createMockPage(), provider, {
+        authorizedNumbers: ['+14085506532'],
+        autoAccept: true,
+        pollInterval: 500,
+        pollTimeout: 300,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 450));
+      expect(timeoutHandler).toHaveBeenCalled();
+    });
+
     it('releases pollMutex and continues after a poll timeout', async () => {
       jest.useRealTimers();
       const provider = createMockProvider({
