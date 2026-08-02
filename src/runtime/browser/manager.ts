@@ -107,13 +107,18 @@ export class BrowserManager {
         ...envBase,
         PULSE_SINK: `pipe_voice_to_ai_${namespace}`,
         PULSE_SOURCE: `src_ai_to_voice_${namespace}`,
-        PULSE_PROP_application_name: appNameVoice,
+        // NB: the property name after PULSE_PROP_ is used literally — it
+        // must contain the dot. PULSE_PROP_application_name (underscore)
+        // sets a useless *custom* property and leaves application.name as
+        // plain "Chromium", which also makes module-stream-restore mix up
+        // the two browsers' streams.
+        'PULSE_PROP_application.name': appNameVoice,
       });
       aiCtx = await this.launchOne('ai', config.tempProfilePath, {
         ...envBase,
         PULSE_SINK: `pipe_ai_to_voice_${namespace}`,
         PULSE_SOURCE: `src_voice_to_ai_${namespace}`,
-        PULSE_PROP_application_name: appNameAI,
+        'PULSE_PROP_application.name': appNameAI,
       });
 
       await voiceCtx.grantPermissions(['microphone'], { origin: providers.voiceOrigin });

@@ -93,7 +93,7 @@ describe('BrowserManager', () => {
         expect.objectContaining({
           PULSE_SINK: 'pipe_voice_to_ai_test_inst',
           PULSE_SOURCE: 'src_ai_to_voice_test_inst',
-          PULSE_PROP_application_name: 'Chromium-Voice-test_inst',
+          'PULSE_PROP_application.name': 'Chromium-Voice-test_inst',
         })
       );
       expect(mockLauncher).toHaveBeenNthCalledWith(
@@ -102,7 +102,7 @@ describe('BrowserManager', () => {
         expect.objectContaining({
           PULSE_SINK: 'pipe_ai_to_voice_test_inst',
           PULSE_SOURCE: 'src_voice_to_ai_test_inst',
-          PULSE_PROP_application_name: 'Chromium-AI-test_inst',
+          'PULSE_PROP_application.name': 'Chromium-AI-test_inst',
         })
       );
     });
