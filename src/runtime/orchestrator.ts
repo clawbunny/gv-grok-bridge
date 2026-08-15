@@ -41,9 +41,11 @@ const MAX_RECYCLES = 3;
 const RECYCLE_WINDOW_MS = 30 * 60 * 1000;
 /** Health ticks with zero open websockets before the voice page is declared deaf. */
 const WS_DEAD_TICKS_THRESHOLD = 3;
-/** Silent-audio sampling cadence while bridged. */
-const AUDIO_SAMPLE_INTERVAL_MS = 30000;
-/** Consecutive silent samples before flagging. */
+/** Silent-audio sampling cadence while bridged. First sample is sooner (greeting window). */
+const AUDIO_SAMPLE_INTERVAL_MS = 8000;
+/** Delay before the first in-call audio sample (Grok's greeting should be audible by then). */
+const AUDIO_FIRST_SAMPLE_MS = 4000;
+/** Consecutive silent samples before flagging / recovering. */
 const SILENT_SAMPLE_THRESHOLD = 2;
 /** Canary calls are hung up by the bridge after this long. */
 const CANARY_HANGUP_MS = 30000;
@@ -75,12 +77,15 @@ export class BridgeOrchestrator {
   private consecutiveAiProbeFailures = 0;
   private consecutiveVoicePollTimeouts = 0;
   private wsDeadTicks = 0;
+  private aiWsDeadTicks = 0;
   private silentAiSamples = 0;
   private silentCallerSamples = 0;
   private pendingRestart: string | null = null;
   private recycleTimestamps: Record<PageRole, number[]> = { voice: [], ai: [] };
   private callTracker: CallTracker | null = null;
   private callEndReason: CallEndReason = 'caller_ended';
+  private aiRecoveredThisCall = false;
+  private audioFirstSampleTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private config: BridgeConfig,
@@ -301,6 +306,7 @@ export class BridgeOrchestrator {
     this.logger.info('Call accepted, activating AI voice mode...');
     this.status.inCall = true;
     this.status.currentCall = call;
+    this.aiRecoveredThisCall = false;
     this.callTracker?.markAccepted();
 
     try {
@@ -319,31 +325,7 @@ export class BridgeOrchestrator {
       }
 
       this.transition('ACTIVATE_AI');
-      const activated = await this.aiController.activateVoiceMode(pair.aiPage);
-      this.status.voiceModeActive = activated;
-
-      // Verify a voice session really started — activation clicks can
-      // silently no-op (e.g. account out of voice credits)
-      if (activated && this.aiProvider.verifyVoiceSession) {
-        const verified = await this.aiProvider.verifyVoiceSession(pair.aiPage, this.logger);
-        if (verified) {
-          if (this.status.aiVoiceUnavailable) {
-            this.logger.info('AI voice session verified — clearing aiVoiceUnavailable');
-          }
-          this.status.aiVoiceUnavailable = false;
-          this.status.aiVoiceStatusDetail = undefined;
-          this.callTracker?.markBridged();
-        } else {
-          this.status.aiVoiceUnavailable = true;
-          this.status.aiVoiceStatusDetail =
-            'AI voice session did not start after activation click (account may be out of voice credits)';
-          this.callEndReason = 'ai_voice_unavailable';
-          this.logger.error('AI voice session verification failed', { detail: this.status.aiVoiceStatusDetail });
-        }
-        this.writeStatusFile();
-      } else if (activated) {
-        this.callTracker?.markBridged();
-      }
+      const verified = await this.ensureVoiceSession(true);
 
       // Assert audio routing now, then keep it asserted event-driven.
       this.assertAudioRouting();
@@ -357,12 +339,16 @@ export class BridgeOrchestrator {
         return;
       }
 
-      if (activated) {
+      if (verified) {
         this.transition('BRIDGED');
-      } else {
+      } else if (!this.status.voiceModeActive) {
         this.callEndReason = 'bridge_error';
         this.logger.error('AI voice mode activation returned false');
         this.writeStatusFile(['ai_activation_failed: voice mode could not be activated']);
+      } else {
+        this.callEndReason = 'ai_voice_unavailable';
+        this.logger.error('AI voice session could not be verified after retry');
+        this.writeStatusFile();
       }
 
       if (this.isCanaryCall()) {
@@ -440,6 +426,11 @@ export class BridgeOrchestrator {
       await this.maybeRestart();
     } else if (!this.status.aiPageResponsive) {
       await this.recyclePage('ai', 'AI page unresponsive — recycling after call');
+    } else {
+      // Grok.com goes stale if left on the same conversation. A planned
+      // recycle after every call gives the next caller a fresh session
+      // and does not count against the emergency recycle budget.
+      await this.recyclePage('ai', 'planned recycle after call', { countAgainstBudget: false });
     }
   }
 
@@ -475,8 +466,68 @@ export class BridgeOrchestrator {
     await this.recyclePage('voice', `voice page poll timeouts x${threshold}`);
   }
 
-  private async recyclePage(role: PageRole, reason: string): Promise<void> {
-    if (!this.canRecycle(role)) {
+  /**
+   * Activate Grok voice and verify a *new* session actually started.
+   * When verification fails and `allowRecycle` is set, recycle the AI
+   * page (fresh grok.com) and try once more — never interrupt a dead
+   * session with a keyboard-toggle on the same stale page.
+   */
+  private async ensureVoiceSession(allowRecycle: boolean): Promise<boolean> {
+    const pair = this.browserManager.getPair();
+    if (!pair) {
+      this.logger.error('Browser pair not available for AI voice activation');
+      this.status.voiceModeActive = false;
+      return false;
+    }
+
+    const activated = await this.aiController.activateVoiceMode(pair.aiPage);
+    this.status.voiceModeActive = activated;
+    if (!activated) {
+      this.status.aiVoiceUnavailable = true;
+      this.status.aiVoiceStatusDetail = 'AI voice mode activation returned false';
+      this.writeStatusFile();
+      return false;
+    }
+
+    if (!this.aiProvider.verifyVoiceSession) {
+      this.status.aiVoiceUnavailable = false;
+      this.status.aiVoiceStatusDetail = undefined;
+      this.callTracker?.markBridged();
+      return true;
+    }
+
+    let verified = await this.aiProvider.verifyVoiceSession(pair.aiPage, this.logger);
+    if (!verified && allowRecycle && this.status.inCall) {
+      this.logger.warn('Voice session not verified — recycling AI page and retrying');
+      await this.recyclePage('ai', 'voice session did not start after activation');
+      return this.status.voiceModeActive && !this.status.aiVoiceUnavailable;
+    }
+
+    if (verified) {
+      if (this.status.aiVoiceUnavailable) {
+        this.logger.info('AI voice session verified — clearing aiVoiceUnavailable');
+      }
+      this.status.aiVoiceUnavailable = false;
+      this.status.aiVoiceStatusDetail = undefined;
+      this.callTracker?.markBridged();
+    } else {
+      this.status.aiVoiceUnavailable = true;
+      this.status.aiVoiceStatusDetail =
+        'AI voice session did not start after activation (page recycled/retried if possible)';
+      this.callEndReason = 'ai_voice_unavailable';
+      this.logger.error('AI voice session verification failed', { detail: this.status.aiVoiceStatusDetail });
+    }
+    this.writeStatusFile();
+    return verified;
+  }
+
+  private async recyclePage(
+    role: PageRole,
+    reason: string,
+    opts: { countAgainstBudget?: boolean } = {},
+  ): Promise<void> {
+    const countAgainstBudget = opts.countAgainstBudget !== false;
+    if (countAgainstBudget && !this.canRecycle(role)) {
       this.pendingRestart = `${role} page recycle budget exhausted (${MAX_RECYCLES} in ${RECYCLE_WINDOW_MS / 60000}min)`;
       this.logger.error('Recycle budget exhausted — escalating to restart', { role, reason });
       return;
@@ -510,16 +561,12 @@ export class BridgeOrchestrator {
           return;
         }
         this.consecutiveAiProbeFailures = 0;
+        this.aiWsDeadTicks = 0;
         this.status.aiPageResponsive = true;
         this.status.aiPageRecycles = (this.status.aiPageRecycles ?? 0) + 1;
         // If a call is active, try to re-establish the AI session
         if (this.status.inCall) {
-          const reactivated = await this.aiController.activateVoiceMode(page);
-          this.status.voiceModeActive = reactivated;
-          if (reactivated && this.aiProvider.verifyVoiceSession) {
-            const verified = await this.aiProvider.verifyVoiceSession(page, this.logger);
-            this.status.aiVoiceUnavailable = !verified;
-          }
+          await this.ensureVoiceSession(false);
         }
       }
       this.status.lastPageReload = new Date().toISOString();
@@ -527,7 +574,9 @@ export class BridgeOrchestrator {
       this.logger.info(`${role} page recycled successfully`);
     } catch (err) {
       this.logger.error(`Failed to recycle ${role} page`, { error: (err as Error).message });
-      this.pendingRestart = `${role} page recycle failed: ${(err as Error).message}`;
+      if (countAgainstBudget) {
+        this.pendingRestart = `${role} page recycle failed: ${(err as Error).message}`;
+      }
     }
   }
 
@@ -557,15 +606,22 @@ export class BridgeOrchestrator {
     this.stopAudioSampling();
     this.silentAiSamples = 0;
     this.silentCallerSamples = 0;
-    this.audioSampleTimer = setInterval(() => {
+    const sample = () => {
       this.sampleAudioDirections().catch((err) =>
         this.logger.warn('Audio sampling failed', { error: (err as Error).message }),
       );
-    }, AUDIO_SAMPLE_INTERVAL_MS);
+    };
+    this.audioFirstSampleTimer = setTimeout(sample, AUDIO_FIRST_SAMPLE_MS);
+    if (this.audioFirstSampleTimer.unref) this.audioFirstSampleTimer.unref();
+    this.audioSampleTimer = setInterval(sample, AUDIO_SAMPLE_INTERVAL_MS);
     if (this.audioSampleTimer.unref) this.audioSampleTimer.unref();
   }
 
   private stopAudioSampling(): void {
+    if (this.audioFirstSampleTimer) {
+      clearTimeout(this.audioFirstSampleTimer);
+      this.audioFirstSampleTimer = null;
+    }
     if (this.audioSampleTimer) {
       clearInterval(this.audioSampleTimer);
       this.audioSampleTimer = null;
@@ -595,6 +651,11 @@ export class BridgeOrchestrator {
       this.callTracker.silentAiAudio = true;
       this.logger.error('Silent AI audio detected — caller likely hears nothing', { aiLevel });
       this.writeStatusFile(['silent_ai_audio: no audio from AI to caller direction']);
+      if (!this.aiRecoveredThisCall && this.status.inCall) {
+        this.aiRecoveredThisCall = true;
+        this.logger.warn('Recycling AI page to recover a silent Grok session');
+        await this.recyclePage('ai', 'silent AI audio during call');
+      }
     }
   }
 
@@ -656,7 +717,8 @@ export class BridgeOrchestrator {
     }
 
     // WebSocket liveness — a Google Voice page with no open websockets is
-    // deaf: it will never show an incoming call. Idle only.
+    // deaf: it will never show an incoming call. Same for grok.com: a
+    // dead backend means voice mode cannot start. Idle only.
     if (!this.status.inCall && this.status.running) {
       const openWs = this.browserManager.getOpenWebSocketCount('voice');
       if (openWs === 0) {
@@ -667,6 +729,17 @@ export class BridgeOrchestrator {
         }
       } else {
         this.wsDeadTicks = 0;
+      }
+
+      const aiWs = this.browserManager.getOpenWebSocketCount('ai');
+      if (aiWs === 0) {
+        this.aiWsDeadTicks++;
+        if (this.aiWsDeadTicks >= WS_DEAD_TICKS_THRESHOLD) {
+          this.aiWsDeadTicks = 0;
+          await this.recyclePage('ai', 'AI page has no open websockets (backend connection lost)');
+        }
+      } else {
+        this.aiWsDeadTicks = 0;
       }
     }
 

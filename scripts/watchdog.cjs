@@ -35,7 +35,14 @@ const STATE_FILE = path.join(STATE_DIR, 'watchdog-state.json');
 
 const STALE_AFTER_MS = 90 * 1000;
 const CALL_ISSUE_WINDOW_MS = 15 * 60 * 1000;
-const CALL_ISSUE_REASONS = ['accept_failed', 'silent_ai_audio'];
+const CALL_ISSUE_REASONS = ['accept_failed', 'silent_ai_audio', 'ai_voice_unavailable'];
+const RESTART_REASONS = [
+  'silent_ai_audio',
+  'call_silent_ai_audio',
+  'ai_voice_unavailable',
+  'call_ai_voice_unavailable',
+];
+const RESTART_COOLDOWN_MS = 20 * 60 * 1000;
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -125,6 +132,26 @@ function saveState(state) {
   } catch { /* best effort */ }
 }
 
+function statusOf(instanceId) {
+  return readJson(path.join(STATE_DIR, 'instances', instanceId, 'status.json'));
+}
+
+function shouldRestart(issues) {
+  return issues.some((issue) => RESTART_REASONS.some((r) => issue.includes(r)));
+}
+
+function restartInstance(instanceId) {
+  const unit = `gv-bridge-${instanceId}.service`;
+  try {
+    execFileSync('systemctl', ['--user', 'restart', unit], { timeout: 60000 });
+    log(`restarted ${unit}`);
+    return true;
+  } catch (err) {
+    log(`failed to restart ${unit}: ${err.message}`);
+    return false;
+  }
+}
+
 function sendAlert(subject, body, toOverride) {
   const webhook = process.env.GV_WATCHDOG_WEBHOOK;
   const mailCmd = process.env.GV_WATCHDOG_MAIL_CMD;
@@ -182,11 +209,30 @@ function main() {
     const prev = state[instanceId];
 
     if (issues.length > 0 && prev !== key) {
+      const live = statusOf(instanceId);
+      const inCall = !!(live && live.status && live.status.inCall);
+      const restartKey = `__restart__${instanceId}`;
+      const lastRestart = Number(state[restartKey] || 0);
+      const cooledDown = Date.now() - lastRestart > RESTART_COOLDOWN_MS;
+      let restarted = false;
+      if (shouldRestart(issues) && !inCall && cooledDown) {
+        restarted = restartInstance(instanceId);
+        if (restarted) {
+          issues.push('watchdog_restarted_service');
+          state[restartKey] = Date.now();
+        }
+      } else if (shouldRestart(issues) && inCall) {
+        log(`${instanceId}: restart deferred — call in progress`);
+      } else if (shouldRestart(issues) && !cooledDown) {
+        log(`${instanceId}: restart skipped — cooldown`);
+      }
+
       const subject = `[gv-bridge] ${instanceId}: ${issues.length} issue(s) detected`;
       const body = [
         `Instance: ${instanceId}`,
         `Host: ${os.hostname()}`,
         `Time: ${new Date().toISOString()}`,
+        restarted ? 'Action: restarted the bridge service' : '',
         '',
         'Issues:',
         ...issues.map((i) => `  - ${i}`),
@@ -194,7 +240,7 @@ function main() {
         'Inspect:',
         `  journalctl --user -u gv-bridge-${instanceId} -n 100`,
         `  cat ~/.local/state/gv-bridge/instances/${instanceId}/status.json`,
-      ].join('\n');
+      ].filter((line, idx, arr) => line !== '' || arr[idx - 1] !== '').join('\n');
       sendAlert(subject, body, alertEmailOf(instanceId));
       state[instanceId] = key;
       changed = true;

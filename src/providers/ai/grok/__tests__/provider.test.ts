@@ -38,6 +38,7 @@ function createMockPage(overrides: {
       return Promise.resolve(undefined);
     }),
     waitForTimeout: jest.fn().mockResolvedValue(undefined),
+    evaluate: jest.fn().mockResolvedValue(null),
     context: jest.fn().mockReturnValue({
       grantPermissions: jest.fn().mockResolvedValue(undefined),
     }),
@@ -129,16 +130,51 @@ describe('GrokProvider', () => {
 
     it('tracks voice mode as active after successful activation', async () => {
       const page = createMockPage();
+      const click = jest.fn().mockResolvedValue(undefined);
       page.locator = jest.fn().mockImplementation(() => ({
         count: jest.fn().mockResolvedValue(1),
         first: jest.fn().mockReturnThis(),
-        click: jest.fn().mockResolvedValue(undefined),
+        click,
         isVisible: jest.fn().mockResolvedValue(true),
       }));
 
       const result = await provider.activateVoiceMode(page, silentLogger as any);
       expect(result).toBe(true);
       expect(provider.isVoiceModeActive()).toBe(true);
+      expect(click).toHaveBeenCalledWith(expect.objectContaining({ noWaitAfter: true }));
+      expect(page.keyboard.press).not.toHaveBeenCalledWith('Control+Shift+O');
+    });
+
+    it('does not press the keyboard shortcut after a click that already landed', async () => {
+      const page = createMockPage();
+      const click = jest.fn().mockRejectedValue(
+        new Error('locator.click: Timeout 5000ms exceeded.\nCall log:\n  - performing click action\n  - click action done\n  - waiting for scheduled navigations to finish'),
+      );
+      page.locator = jest.fn().mockImplementation((selector: string) => ({
+        count: jest.fn().mockResolvedValue(/voice|microphone/i.test(selector) ? 1 : 0),
+        first: jest.fn().mockReturnThis(),
+        click,
+        isVisible: jest.fn().mockResolvedValue(true),
+      }));
+
+      const result = await provider.activateVoiceMode(page, silentLogger as any);
+      expect(result).toBe(true);
+      expect(provider.isVoiceModeActive()).toBe(true);
+      expect(page.keyboard.press).not.toHaveBeenCalledWith('Control+Shift+O');
+    });
+
+    it('falls back to the keyboard shortcut only when the click never happened', async () => {
+      const page = createMockPage();
+      page.locator = jest.fn().mockImplementation((selector: string) => ({
+        count: jest.fn().mockResolvedValue(/voice|microphone/i.test(selector) ? 1 : 0),
+        first: jest.fn().mockReturnThis(),
+        click: jest.fn().mockRejectedValue(new Error('element is not attached')),
+        isVisible: jest.fn().mockResolvedValue(true),
+      }));
+
+      const result = await provider.activateVoiceMode(page, silentLogger as any);
+      expect(result).toBe(true);
+      expect(page.keyboard.press).toHaveBeenCalledWith('Control+Shift+O');
     });
 
     it('tracks voice mode as inactive after deactivation', async () => {
@@ -176,7 +212,9 @@ describe('GrokProvider', () => {
         waitForTimeout: jest.fn().mockResolvedValue(undefined),
         locator: jest.fn().mockImplementation((selector: string) => {
           const isDialog = /role="dialog"|alertdialog|dialog-portal/.test(selector);
-          const isActiveIndicator = /stop|end|mute|voice.*active|listening|orb/i.test(selector);
+          const isEnterVoice = /Enter voice mode/i.test(selector);
+          const isActiveIndicator =
+            !isEnterVoice && /stop|end|mute|voice.*active|listening|orb/i.test(selector);
           const isBody = selector === 'body';
 
           let count = 0;
@@ -221,7 +259,9 @@ describe('GrokProvider', () => {
       expect(result).toBe(true);
     });
 
-    it('returns true when RTC hooks report a connected peer', async () => {
+    it('returns false when RTC hooks only report a leftover connected peer', async () => {
+      // A previous call's RTCPeerConnection can stay "connected" after
+      // voice is toggled off. That must not count as a new session.
       const page = {
         waitForTimeout: jest.fn().mockResolvedValue(undefined),
         evaluate: jest.fn().mockResolvedValue({ liveAudioTrack: false, connectedPeer: true }),
@@ -233,7 +273,7 @@ describe('GrokProvider', () => {
         })),
       } as any;
       const result = await provider.verifyVoiceSession(page, silentLogger as any);
-      expect(result).toBe(true);
+      expect(result).toBe(false);
     });
 
     it('returns false when a quota/upsell dialog is shown', async () => {

@@ -90,18 +90,34 @@ export class GrokProvider implements AIProvider {
     try {
       logger.info('Attempting to activate Grok voice mode...');
 
+      await this.startFreshConversation(page, logger);
       await this.dismissCookieConsent(page, logger);
       await this.dismissModals(page, logger);
+      // Drop leftover peers/streams so verifyVoiceSession cannot pass
+      // on a previous call's WebRTC objects.
+      await this.resetRtcHooks(page);
 
-      const micLocator = page.locator('button[aria-label*="microphone" i], button[aria-label*="voice" i]').first();
+      const micLocator = page.locator(
+        'button[aria-label*="Enter voice mode" i], button[aria-label*="microphone" i], button[aria-label*="voice" i]',
+      ).first();
       if ((await micLocator.count()) > 0) {
         try {
-          await micLocator.click({ force: true, timeout: 5000 });
+          // noWaitAfter: grok.com treats voice-mode as a client-side
+          // navigation. Playwright's default click waits for that
+          // navigation, times out after the click already landed, and
+          // the old keyboard fallback then *toggled voice back off*.
+          await micLocator.click({ force: true, timeout: 4000, noWaitAfter: true });
           this.voiceModeActive = true;
-          logger.info('Grok voice mode activated (force click)');
+          logger.info('Grok voice mode activated (click)');
           return true;
         } catch (clickErr) {
-          logger.warn('Force click failed, trying keyboard shortcut', { error: (clickErr as Error).message });
+          const msg = (clickErr as Error).message || '';
+          if (/click action done|waiting for scheduled navigations/i.test(msg)) {
+            this.voiceModeActive = true;
+            logger.info('Grok voice mode activated (click; navigation wait ignored)');
+            return true;
+          }
+          logger.warn('Click failed, trying keyboard shortcut', { error: msg });
         }
       }
 
@@ -113,14 +129,6 @@ export class GrokProvider implements AIProvider {
         return true;
       } catch (kbErr) {
         logger.warn('Keyboard shortcut failed', { error: (kbErr as Error).message });
-      }
-
-      const fallback = page.locator('div[class*="input"] button, div[class*="chat"] button').first();
-      if ((await fallback.count()) > 0) {
-        await fallback.click({ force: true });
-        this.voiceModeActive = true;
-        logger.info('Grok voice mode activated (fallback)');
-        return true;
       }
 
       logger.warn('Could not find microphone button on Grok page');
@@ -152,12 +160,12 @@ export class GrokProvider implements AIProvider {
 
       const stopBtn = await this.findButton(page, 'button[aria-label*="stop" i], button[aria-label*="cancel" i], button[aria-label*="keyboard" i]');
       if (stopBtn) {
-        await stopBtn.click({ force: true });
+        await stopBtn.click({ force: true, noWaitAfter: true });
         logger.debug('Clicked stop button');
       } else {
         const micBtn = await this.findButton(page, 'button[aria-label*="microphone" i], button[aria-label*="voice" i]');
         if (micBtn) {
-          await micBtn.click({ force: true });
+          await micBtn.click({ force: true, noWaitAfter: true });
           logger.debug('Clicked mic button to toggle off');
         }
       }
@@ -178,69 +186,54 @@ export class GrokProvider implements AIProvider {
 
   async verifyVoiceSession(page: Page, logger: Logger): Promise<boolean> {
     try {
-      // Give the page a moment to react to the activation click
-      await page.waitForTimeout(4000);
+      const quotaPattern = /upgrade|subscribe|super ?grok|credit|limit reached|try again later|unavailable/i;
+      const deadline = Date.now() + 8000;
+      let iterations = 0;
 
-      // 1. Deterministic check via RTC hooks (installed by BrowserManager's
-      //    init script): a live audio track or a connected RTCPeerConnection
-      //    proves a voice session regardless of DOM cosmetics.
-      try {
-        const rtcState = await page.evaluate(() => {
-          const hooks = (window as any).__rtcHooks;
-          if (!hooks) return null;
-          const liveAudioTrack = (hooks.streams as MediaStream[]).some(
-            (s) => s.active && s.getAudioTracks().some((t) => t.enabled && t.readyState === 'live'),
-          );
-          const connectedPeer = (hooks.peers as RTCPeerConnection[]).some(
-            (pc) => pc.connectionState === 'connected',
-          );
-          return { liveAudioTrack, connectedPeer };
-        });
-        if (rtcState?.liveAudioTrack || rtcState?.connectedPeer) {
+      while (Date.now() < deadline && iterations < 20) {
+        iterations++;
+        if (await this.hasQuotaBlock(page, quotaPattern, logger)) return false;
+
+        const rtcState = await this.readRtcState(page);
+        // A leftover RTCPeerConnection from a previous call is not proof.
+        // Require a live mic track — that only appears after a fresh
+        // getUserMedia, which we reset just before clicking voice.
+        if (rtcState?.liveAudioTrack) {
           logger.info('Voice session verified via RTC hooks', rtcState);
           return true;
         }
-      } catch {
-        // hooks unavailable (older page) — fall through to DOM checks
-      }
 
-      const quotaPattern = /upgrade|subscribe|super ?grok|credit|limit reached|try again later|unavailable/i;
-
-      // A visible quota/upsell dialog is a definitive failure
-      const dialog = page.locator('div[role="dialog"], div[role="alertdialog"], div[id="dialog-portal"] [data-state="open"]').first();
-      if ((await dialog.count()) > 0) {
-        const text = (await dialog.textContent().catch(() => '')) || '';
-        if (quotaPattern.test(text)) {
-          logger.warn('Grok voice session blocked by quota/upsell dialog', { detail: text.slice(0, 120) });
-          return false;
-        }
-      }
-
-      // Positive indicators that a voice session is live
-      const activeSelectors = [
-        'button[aria-label*="stop" i]',
-        'button[aria-label*="end" i]',
-        'button[aria-label*="mute" i]',
-        '[class*="voice"][class*="active"]',
-        '[class*="listening"]',
-        '[class*="orb"]',
-      ];
-      for (const sel of activeSelectors) {
-        const loc = page.locator(sel).first();
-        if ((await loc.count()) > 0 && (await loc.isVisible().catch(() => false))) {
-          logger.debug(`Voice session verified active via selector: ${sel}`);
+        const uiActive = await this.isVoiceUiActive(page);
+        if (uiActive && rtcState?.connectedPeer) {
+          logger.info('Voice session verified via UI + connected peer', rtcState);
           return true;
         }
+
+        await page.waitForTimeout(400);
       }
 
-      // Full-page quota text as a last check
+      if (await this.hasQuotaBlock(page, quotaPattern, logger)) return false;
+
+      const rtcState = await this.readRtcState(page);
+      if (rtcState?.liveAudioTrack) {
+        logger.info('Voice session verified via RTC hooks', rtcState);
+        return true;
+      }
+
+      if (await this.isVoiceUiActive(page)) {
+        logger.debug('Voice UI looks active');
+        return true;
+      }
+
       const bodyText = (await page.locator('body').textContent().catch(() => '')) || '';
       if (/(voice|audio).{0,40}(upgrade|subscribe|limit|unavailable)/i.test(bodyText)) {
         logger.warn('Grok voice session appears unavailable (page text)');
         return false;
       }
 
-      logger.warn('No voice-session indicators found on Grok page after activation');
+      logger.warn('No voice-session indicators found on Grok page after activation', {
+        rtcState: rtcState ?? undefined,
+      });
       return false;
     } catch (err) {
       logger.error('Failed to verify voice session', { error: (err as Error).message });
@@ -249,6 +242,112 @@ export class GrokProvider implements AIProvider {
   }
 
   // ─── Private helpers ─────────────────────────────────────
+
+  /**
+   * Open a new Grok conversation so voice starts on a clean thread
+   * rather than a days-old chat that still has a half-dead voice UI.
+   */
+  private async startFreshConversation(page: Page, logger: Logger): Promise<void> {
+    const selectors = [
+      'button[aria-label*="new chat" i]',
+      'a[aria-label*="new chat" i]',
+      'button[aria-label*="new conversation" i]',
+      'a[aria-label*="new conversation" i]',
+      'button:has-text("New chat")',
+      'a:has-text("New chat")',
+    ];
+    for (const sel of selectors) {
+      const btn = page.locator(sel).first();
+      if ((await btn.count()) > 0 && (await this.visible(btn))) {
+        try {
+          await btn.click({ force: true, timeout: 3000, noWaitAfter: true });
+          logger.info('Started a fresh Grok conversation');
+          await page.waitForTimeout(800);
+          return;
+        } catch {
+          // try the next selector
+        }
+      }
+    }
+
+    const url = page.url();
+    if (/grok\.com\/chat\//i.test(url) || !/grok\.com/i.test(url)) {
+      try {
+        await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        logger.info('Navigated to grok.com for a fresh session');
+      } catch (err) {
+        logger.warn('Could not navigate to grok.com', { error: (err as Error).message });
+      }
+    }
+  }
+
+  private async resetRtcHooks(page: Page): Promise<void> {
+    try {
+      await page.evaluate(() => {
+        const hooks = (window as unknown as { __rtcHooks?: { peers: unknown[]; streams: unknown[] } }).__rtcHooks;
+        if (hooks) {
+          hooks.peers = [];
+          hooks.streams = [];
+        }
+      });
+    } catch {
+      // hooks unavailable on this page — verify will fall back to the DOM
+    }
+  }
+
+  private async readRtcState(page: Page): Promise<{ liveAudioTrack: boolean; connectedPeer: boolean } | null> {
+    try {
+      return await page.evaluate(() => {
+        const hooks = (window as unknown as {
+          __rtcHooks?: { streams: MediaStream[]; peers: RTCPeerConnection[] };
+        }).__rtcHooks;
+        if (!hooks) return null;
+        const liveAudioTrack = hooks.streams.some(
+          (s) => s.active && s.getAudioTracks().some((t) => t.enabled && t.readyState === 'live'),
+        );
+        const connectedPeer = hooks.peers.some((pc) => pc.connectionState === 'connected');
+        return { liveAudioTrack, connectedPeer };
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private async isVoiceUiActive(page: Page): Promise<boolean> {
+    const enter = page.locator('button[aria-label*="Enter voice mode" i]').first();
+    if ((await enter.count()) > 0 && (await this.visible(enter))) return false;
+
+    const activeSelectors = [
+      'button[aria-label*="stop" i]',
+      'button[aria-label*="end" i]',
+      'button[aria-label*="mute" i]',
+      'button[aria-label*="exit voice" i]',
+      '[class*="voice"][class*="active"]',
+      '[class*="listening"]',
+      '[class*="orb"]',
+    ];
+    for (const sel of activeSelectors) {
+      const loc = page.locator(sel).first();
+      if ((await loc.count()) > 0 && (await this.visible(loc))) return true;
+    }
+    return false;
+  }
+
+  private async hasQuotaBlock(page: Page, quotaPattern: RegExp, logger: Logger): Promise<boolean> {
+    const dialog = page.locator('div[role="dialog"], div[role="alertdialog"], div[id="dialog-portal"] [data-state="open"]').first();
+    if ((await dialog.count()) > 0) {
+      const text = (await dialog.textContent().catch(() => '')) || '';
+      if (quotaPattern.test(text)) {
+        logger.warn('Grok voice session blocked by quota/upsell dialog', { detail: text.slice(0, 120) });
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async visible(locator: { isVisible: (opts?: { timeout?: number }) => Promise<boolean> }): Promise<boolean> {
+    return locator.isVisible({ timeout: 500 }).catch(() => false);
+  }
 
   private async dismissCookieConsent(page: Page, logger: Logger): Promise<void> {
     try {

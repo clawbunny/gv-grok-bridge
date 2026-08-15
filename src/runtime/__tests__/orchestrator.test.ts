@@ -287,7 +287,7 @@ describe('BridgeOrchestrator', () => {
       timestamp: new Date(),
     };
 
-    it('marks aiVoiceUnavailable and writes status when verification fails', async () => {
+    it('recycles the AI page and marks unavailable when verification keeps failing', async () => {
       const statusWriter = { write: jest.fn() };
       orchestrator = new BridgeOrchestrator(
         defaultConfig,
@@ -305,11 +305,12 @@ describe('BridgeOrchestrator', () => {
 
       (mocks.aiProvider.verifyVoiceSession as jest.Mock).mockResolvedValue(false);
       mocks.voiceMonitor._emit('callAccepted', call);
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await new Promise((resolve) => setTimeout(resolve, 30));
 
       const status = orchestrator.getStatus();
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('ai');
       expect(status.aiVoiceUnavailable).toBe(true);
-      expect(status.aiVoiceStatusDetail).toMatch(/credits/);
+      expect(status.aiVoiceStatusDetail).toMatch(/activation|recycled|credits/i);
       expect(statusWriter.write).toHaveBeenCalled();
       const lastIssues = statusWriter.write.mock.calls.at(-1)![1] as string[];
       expect(lastIssues.some((i) => i.startsWith('ai_voice_unavailable'))).toBe(true);
@@ -318,21 +319,33 @@ describe('BridgeOrchestrator', () => {
     it('clears aiVoiceUnavailable on a verified activation', async () => {
       await orchestrator.start();
 
-      (mocks.aiProvider.verifyVoiceSession as jest.Mock).mockResolvedValueOnce(false);
+      (mocks.aiProvider.verifyVoiceSession as jest.Mock).mockResolvedValue(false);
       mocks.voiceMonitor._emit('callAccepted', call);
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await new Promise((resolve) => setTimeout(resolve, 30));
       expect(orchestrator.getStatus().aiVoiceUnavailable).toBe(true);
 
       mocks.voiceMonitor._emit('callEnded');
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await new Promise((resolve) => setTimeout(resolve, 30));
 
-      (mocks.aiProvider.verifyVoiceSession as jest.Mock).mockResolvedValueOnce(true);
+      (mocks.aiProvider.verifyVoiceSession as jest.Mock).mockResolvedValue(true);
       mocks.voiceMonitor._emit('callAccepted', call);
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      await new Promise((resolve) => setTimeout(resolve, 30));
 
       const status = orchestrator.getStatus();
       expect(status.aiVoiceUnavailable).toBe(false);
       expect(status.aiVoiceStatusDetail).toBeUndefined();
+    });
+
+    it('recycles the AI page after a call so the next caller gets a fresh grok.com', async () => {
+      await orchestrator.start();
+      mocks.voiceMonitor._emit('callAccepted', call);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      mocks.browserManager.recyclePage.mockClear();
+
+      mocks.voiceMonitor._emit('callEnded');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('ai');
     });
   });
 
@@ -386,7 +399,9 @@ describe('BridgeOrchestrator', () => {
     });
 
     it('recycles the voice page when it has no open websockets while idle', async () => {
-      (mocks.browserManager.getOpenWebSocketCount as jest.Mock).mockReturnValue(0);
+      (mocks.browserManager.getOpenWebSocketCount as jest.Mock).mockImplementation((role: string) =>
+        role === 'voice' ? 0 : 1,
+      );
 
       await (orchestrator as any).runHealthTick();
       await (orchestrator as any).runHealthTick();
@@ -394,6 +409,20 @@ describe('BridgeOrchestrator', () => {
 
       await (orchestrator as any).runHealthTick();
       expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('voice');
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+
+    it('recycles the AI page when grok.com has no open websockets while idle', async () => {
+      (mocks.browserManager.getOpenWebSocketCount as jest.Mock).mockImplementation((role: string) =>
+        role === 'ai' ? 0 : 1,
+      );
+
+      await (orchestrator as any).runHealthTick();
+      await (orchestrator as any).runHealthTick();
+      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
+
+      await (orchestrator as any).runHealthTick();
+      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('ai');
       expect(exitSpy).not.toHaveBeenCalled();
     });
 
