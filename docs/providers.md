@@ -9,7 +9,7 @@ GV Bridge uses a simple plugin architecture. To add a new voice provider or AI p
 | Voice | `google-voice` | Google Voice (voice.google.com) |
 | Voice | `twilio` | Twilio (stub — not yet implemented) |
 | Voice | `textnow` | TextNow (www.textnow.com) — supports cookie import for cross-device auth |
-| AI | `grok` | Grok (grok.com) |
+| AI | `grok` | Grok (grok.com). Voice start is picky — see [`grok-voice-activation.md`](grok-voice-activation.md). |
 | AI | `chatgpt` | ChatGPT (stub — not yet implemented) |
 
 ### Cookie Import
@@ -121,7 +121,10 @@ export class MyAIProvider implements AIProvider {
   }
 
   async activateVoiceMode(page: Page, logger: Logger): Promise<boolean> {
-    // Click mic button or use keyboard shortcut
+    // Click the provider's dedicated voice-mode control (not dictation).
+    // Use noWaitAfter: true — a client-side route change will otherwise
+    // time out after the click landed. Do not "retry" with a toggle
+    // shortcut if the click already happened. See docs/grok-voice-activation.md.
     this.voiceModeActive = true;
     return true;
   }

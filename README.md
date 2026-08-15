@@ -250,6 +250,25 @@ voicebridge-run
 - Providers may change their DOM. Check logs for selector attempts.
 - Increase log level in instance config to `debug`
 
+### Phone answers but Grok is silent or very slow
+The call was accepted; Grok voice did not start cleanly (wrong control,
+New Chat remount, cookie banner, or a click-timeout that toggled voice
+off). See [`docs/grok-voice-activation.md`](docs/grok-voice-activation.md).
+
+Quick checks:
+
+```bash
+journalctl --user -u gv-bridge-<instance-id> --since "10 min ago" \
+  | grep -E "Enter voice|New chat|Connecting|OneTrust|BRIDGED|keyboard shortcut"
+tail -n 5 ~/.local/state/gv-bridge/instances/<instance-id>/calls.jsonl
+ls -lt /tmp/gv-bridge-debug/grok-after-activate-* | head
+```
+
+A healthy pickup logs `Already on a fresh Grok composer`, then
+`Grok voice mode activated (click)`, then `BRIDGED` in about 5s. Do
+not treat `Control+Shift+O` after `click action done` as success — that
+toggles voice off.
+
 ### PulseAudio module leaks
 - Each instance cleans up its own stale modules on startup
 - If you see duplicates, restart the instance: `voicebridge restart <id>`
