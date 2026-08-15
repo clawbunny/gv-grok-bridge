@@ -2,9 +2,14 @@
  * Grok Provider — implements AIProvider for grok.com
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import type { Page } from 'playwright';
 import type { Logger } from '../../../logger';
 import type { AIProvider } from '../../contracts';
+
+const VOICE_ENTRY_SELECTOR = 'button[aria-label*="Enter voice mode" i]';
+const DEBUG_DIR = process.env.GV_DEBUG_DIR || '/tmp/gv-bridge-debug';
 
 export class GrokProvider implements AIProvider {
   readonly id = 'grok';
@@ -93,32 +98,21 @@ export class GrokProvider implements AIProvider {
       await this.startFreshConversation(page, logger);
       await this.dismissCookieConsent(page, logger);
       await this.dismissModals(page, logger);
-      // Drop leftover peers/streams so verifyVoiceSession cannot pass
-      // on a previous call's WebRTC objects.
       await this.resetRtcHooks(page);
 
-      const micLocator = page.locator(
-        'button[aria-label*="Enter voice mode" i], button[aria-label*="microphone" i], button[aria-label*="voice" i]',
-      ).first();
-      if ((await micLocator.count()) > 0) {
-        try {
-          // noWaitAfter: grok.com treats voice-mode as a client-side
-          // navigation. Playwright's default click waits for that
-          // navigation, times out after the click already landed, and
-          // the old keyboard fallback then *toggled voice back off*.
-          await micLocator.click({ force: true, timeout: 4000, noWaitAfter: true });
-          this.voiceModeActive = true;
-          logger.info('Grok voice mode activated (click)');
-          return true;
-        } catch (clickErr) {
-          const msg = (clickErr as Error).message || '';
-          if (/click action done|waiting for scheduled navigations/i.test(msg)) {
-            this.voiceModeActive = true;
-            logger.info('Grok voice mode activated (click; navigation wait ignored)');
-            return true;
-          }
-          logger.warn('Click failed, trying keyboard shortcut', { error: msg });
+      // Only the waveform "Enter voice mode" control. The composer also
+      // has a dictation mic whose aria-label contains "microphone" —
+      // clicking that starts speech-to-text, not a Grok voice session.
+      const clicked = await this.clickVoiceEntry(page, logger);
+      if (clicked) {
+        if (await this.voiceEntryStillVisible(page)) {
+          logger.warn('Enter voice mode still visible after click — sending shortcut once');
+          await page.keyboard.press('Control+Shift+O').catch(() => undefined);
+          await page.waitForTimeout(400);
         }
+        this.voiceModeActive = true;
+        await this.dumpGrokState(page, logger, 'after-activate');
+        return true;
       }
 
       try {
@@ -126,12 +120,14 @@ export class GrokProvider implements AIProvider {
         await page.waitForTimeout(500);
         this.voiceModeActive = true;
         logger.info('Grok voice mode activated (keyboard shortcut)');
+        await this.dumpGrokState(page, logger, 'after-activate');
         return true;
       } catch (kbErr) {
         logger.warn('Keyboard shortcut failed', { error: (kbErr as Error).message });
       }
 
-      logger.warn('Could not find microphone button on Grok page');
+      logger.warn('Could not find Enter voice mode button on Grok page');
+      await this.dumpGrokState(page, logger, 'activate-failed');
       return false;
     } catch (err) {
       logger.error('Failed to activate voice mode', { error: (err as Error).message });
@@ -246,40 +242,111 @@ export class GrokProvider implements AIProvider {
   // ─── Private helpers ─────────────────────────────────────
 
   /**
-   * Open a new Grok conversation so voice starts on a clean thread
-   * rather than a days-old chat that still has a half-dead voice UI.
+   * Only leave an existing thread. Clicking New Chat while already on
+   * the empty composer remounts grok.com and delays voice by ~30s.
    */
   private async startFreshConversation(page: Page, logger: Logger): Promise<void> {
+    const url = page.url();
+    if (!/grok\.com\/chat\/[A-Za-z0-9_-]+/i.test(url)) {
+      logger.info('Already on a fresh Grok composer — skipping New chat', { url });
+      return;
+    }
+
     const selectors = [
       'button[aria-label*="new chat" i]',
       'a[aria-label*="new chat" i]',
-      'button[aria-label*="new conversation" i]',
-      'a[aria-label*="new conversation" i]',
-      'button:has-text("New chat")',
-      'a:has-text("New chat")',
+      'button:has-text("New Chat")',
+      'a:has-text("New Chat")',
     ];
     for (const sel of selectors) {
       const btn = page.locator(sel).first();
       if ((await btn.count()) > 0 && (await this.visible(btn))) {
         try {
           await btn.click({ force: true, timeout: 3000, noWaitAfter: true });
-          logger.info('Started a fresh Grok conversation');
-          await page.waitForTimeout(800);
+          logger.info('Left previous Grok thread for a new conversation');
+          await this.waitForVoiceEntry(page, 5000);
           return;
         } catch {
           // try the next selector
         }
       }
     }
+  }
 
-    const url = page.url();
-    if (/grok\.com\/chat\//i.test(url) || !/grok\.com/i.test(url)) {
-      try {
-        await page.goto(this.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        logger.info('Navigated to grok.com for a fresh session');
-      } catch (err) {
-        logger.warn('Could not navigate to grok.com', { error: (err as Error).message });
+  private async clickVoiceEntry(page: Page, logger: Logger): Promise<boolean> {
+    await this.waitForVoiceEntry(page, 4000);
+    const btn = page.locator(VOICE_ENTRY_SELECTOR).first();
+    if ((await btn.count()) === 0) return false;
+    try {
+      await btn.click({ force: true, timeout: 4000, noWaitAfter: true });
+      logger.info('Grok voice mode activated (click)');
+      return true;
+    } catch (clickErr) {
+      const msg = (clickErr as Error).message || '';
+      if (/click action done|waiting for scheduled navigations/i.test(msg)) {
+        logger.info('Grok voice mode activated (click; navigation wait ignored)');
+        return true;
       }
+      logger.warn('Enter voice mode click failed', { error: msg });
+      return false;
+    }
+  }
+
+  private async waitForVoiceEntry(page: Page, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const btn = page.locator(VOICE_ENTRY_SELECTOR).first();
+      if ((await btn.count()) > 0 && (await this.visible(btn))) return;
+      await page.waitForTimeout(200);
+    }
+  }
+
+  private async voiceEntryStillVisible(page: Page): Promise<boolean> {
+    // Give the voice overlay a moment to replace the composer button.
+    for (let i = 0; i < 8; i++) {
+      const btn = page.locator(VOICE_ENTRY_SELECTOR).first();
+      if ((await btn.count()) === 0 || !(await this.visible(btn))) return false;
+      await page.waitForTimeout(200);
+    }
+    return true;
+  }
+
+  private async dumpGrokState(page: Page, logger: Logger, tag: string): Promise<void> {
+    try {
+      fs.mkdirSync(DEBUG_DIR, { recursive: true });
+      const ts = Date.now();
+      const png = path.join(DEBUG_DIR, `grok-${tag}-${ts}.png`);
+      const json = path.join(DEBUG_DIR, `grok-${tag}-${ts}.json`);
+      if (typeof page.screenshot === 'function') {
+        await page.screenshot({ path: png }).catch(() => undefined);
+      }
+      const info = await page.evaluate(() => {
+        const hooks = (window as unknown as {
+          __rtcHooks?: { peers: RTCPeerConnection[]; streams: MediaStream[] };
+        }).__rtcHooks;
+        return {
+          url: location.href,
+          title: document.title,
+          buttons: Array.from(document.querySelectorAll('button')).slice(0, 50).map((b) => ({
+            aria: b.getAttribute('aria-label'),
+            text: (b.textContent || '').trim().slice(0, 48),
+          })),
+          rtc: hooks
+            ? {
+                peers: hooks.peers.map((p) => p.connectionState),
+                liveTracks: hooks.streams.filter(
+                  (s) => s.active && s.getAudioTracks().some((t) => t.readyState === 'live'),
+                ).length,
+              }
+            : null,
+        };
+      }).catch(() => null);
+      if (info) fs.writeFileSync(json, JSON.stringify(info, null, 2));
+      logger.info(`Grok UI dumped to ${png.replace(/\.png$/, '')}.{png,json}`, {
+        url: info && (info as { url?: string }).url,
+      });
+    } catch (err) {
+      logger.debug('Grok UI dump failed', { error: (err as Error).message });
     }
   }
 

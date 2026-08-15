@@ -130,12 +130,20 @@ describe('GrokProvider', () => {
 
     it('tracks voice mode as active after successful activation', async () => {
       const page = createMockPage();
-      const click = jest.fn().mockResolvedValue(undefined);
-      page.locator = jest.fn().mockImplementation(() => ({
-        count: jest.fn().mockResolvedValue(1),
+      let voiceOpen = false;
+      const click = jest.fn().mockImplementation(() => {
+        voiceOpen = true;
+        return Promise.resolve(undefined);
+      });
+      page.locator = jest.fn().mockImplementation((selector: string) => ({
+        count: jest.fn().mockImplementation(() =>
+          Promise.resolve(/Enter voice mode/i.test(selector) && !voiceOpen ? 1 : 0),
+        ),
         first: jest.fn().mockReturnThis(),
         click,
-        isVisible: jest.fn().mockResolvedValue(true),
+        isVisible: jest.fn().mockImplementation(() =>
+          Promise.resolve(/Enter voice mode/i.test(selector) && !voiceOpen),
+        ),
       }));
 
       const result = await provider.activateVoiceMode(page, silentLogger as any);
@@ -145,16 +153,47 @@ describe('GrokProvider', () => {
       expect(page.keyboard.press).not.toHaveBeenCalledWith('Control+Shift+O');
     });
 
-    it('does not press the keyboard shortcut after a click that already landed', async () => {
-      const page = createMockPage();
-      const click = jest.fn().mockRejectedValue(
-        new Error('locator.click: Timeout 5000ms exceeded.\nCall log:\n  - performing click action\n  - click action done\n  - waiting for scheduled navigations to finish'),
-      );
+    it('does not click New chat when already on the grok.com composer', async () => {
+      const page = createMockPage({ url: 'https://grok.com/' });
+      let voiceOpen = false;
+      const click = jest.fn().mockImplementation(() => {
+        voiceOpen = true;
+        return Promise.resolve(undefined);
+      });
       page.locator = jest.fn().mockImplementation((selector: string) => ({
-        count: jest.fn().mockResolvedValue(/voice|microphone/i.test(selector) ? 1 : 0),
+        count: jest.fn().mockImplementation(() =>
+          Promise.resolve(/Enter voice mode/i.test(selector) && !voiceOpen ? 1 : 0),
+        ),
         first: jest.fn().mockReturnThis(),
         click,
-        isVisible: jest.fn().mockResolvedValue(true),
+        isVisible: jest.fn().mockImplementation(() =>
+          Promise.resolve(/Enter voice mode/i.test(selector) && !voiceOpen),
+        ),
+      }));
+
+      await provider.activateVoiceMode(page, silentLogger as any);
+      const selectors = (page.locator as jest.Mock).mock.calls.map((c: string[]) => c[0]);
+      expect(selectors.some((s: string) => /new chat/i.test(s))).toBe(false);
+    });
+
+    it('does not press the keyboard shortcut after a click that already landed', async () => {
+      const page = createMockPage();
+      let voiceOpen = false;
+      const click = jest.fn().mockImplementation(() => {
+        voiceOpen = true;
+        return Promise.reject(
+          new Error('locator.click: Timeout 5000ms exceeded.\nCall log:\n  - performing click action\n  - click action done\n  - waiting for scheduled navigations to finish'),
+        );
+      });
+      page.locator = jest.fn().mockImplementation((selector: string) => ({
+        count: jest.fn().mockImplementation(() =>
+          Promise.resolve(/Enter voice mode/i.test(selector) && !voiceOpen ? 1 : 0),
+        ),
+        first: jest.fn().mockReturnThis(),
+        click,
+        isVisible: jest.fn().mockImplementation(() =>
+          Promise.resolve(/Enter voice mode/i.test(selector) && !voiceOpen),
+        ),
       }));
 
       const result = await provider.activateVoiceMode(page, silentLogger as any);

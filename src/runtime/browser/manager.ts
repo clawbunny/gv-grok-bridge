@@ -68,6 +68,8 @@ export function createBrowserLauncher(headless: boolean, extraArgs?: string[]): 
         '--use-fake-ui-for-media-stream',
         '--no-first-run',
         '--no-default-browser-check',
+        '--hide-crash-restore-bubble',
+        '--disable-session-crashed-bubble',
         ...(extraArgs || []),
       ],
       env,

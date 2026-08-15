@@ -429,11 +429,6 @@ export class BridgeOrchestrator {
       await this.maybeRestart();
     } else if (!this.status.aiPageResponsive) {
       await this.recyclePage('ai', 'AI page unresponsive — recycling after call');
-    } else {
-      // Grok.com goes stale if left on the same conversation. A planned
-      // recycle after every call gives the next caller a fresh session
-      // and does not count against the emergency recycle budget.
-      await this.recyclePage('ai', 'planned recycle after call', { countAgainstBudget: false });
     }
   }
 

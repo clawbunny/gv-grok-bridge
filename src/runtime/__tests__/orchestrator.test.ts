@@ -336,7 +336,7 @@ describe('BridgeOrchestrator', () => {
       expect(status.aiVoiceStatusDetail).toBeUndefined();
     });
 
-    it('recycles the AI page after a call so the next caller gets a fresh grok.com', async () => {
+    it('does not recycle a healthy AI page after a call (keeps grok.com warm)', async () => {
       await orchestrator.start();
       mocks.voiceMonitor._emit('callAccepted', call);
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -345,7 +345,7 @@ describe('BridgeOrchestrator', () => {
       mocks.voiceMonitor._emit('callEnded');
       await new Promise((resolve) => setTimeout(resolve, 20));
 
-      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('ai');
+      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
     });
   });
 
