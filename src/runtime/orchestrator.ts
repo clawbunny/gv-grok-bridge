@@ -41,10 +41,14 @@ const MAX_RECYCLES = 3;
 const RECYCLE_WINDOW_MS = 30 * 60 * 1000;
 /** Health ticks with zero open websockets before the voice page is declared deaf. */
 const WS_DEAD_TICKS_THRESHOLD = 3;
-/** Silent-audio sampling cadence while bridged. First sample is sooner (greeting window). */
-const AUDIO_SAMPLE_INTERVAL_MS = 8000;
-/** Delay before the first in-call audio sample (Grok's greeting should be audible by then). */
-const AUDIO_FIRST_SAMPLE_MS = 4000;
+/** Silent-audio sampling cadence while bridged. */
+const AUDIO_SAMPLE_INTERVAL_MS = 10000;
+/**
+ * Delay before the first in-call audio sample. Grok's WebRTC peer often
+ * connects a few seconds after getUserMedia; sampling before the greeting
+ * is a false "silent AI" and used to tear down a working session.
+ */
+const AUDIO_FIRST_SAMPLE_MS = 15000;
 /** Consecutive silent samples before flagging / recovering. */
 const SILENT_SAMPLE_THRESHOLD = 2;
 /** Canary calls are hung up by the bridge after this long. */
@@ -77,7 +81,6 @@ export class BridgeOrchestrator {
   private consecutiveAiProbeFailures = 0;
   private consecutiveVoicePollTimeouts = 0;
   private wsDeadTicks = 0;
-  private aiWsDeadTicks = 0;
   private silentAiSamples = 0;
   private silentCallerSamples = 0;
   private pendingRestart: string | null = null;
@@ -561,7 +564,6 @@ export class BridgeOrchestrator {
           return;
         }
         this.consecutiveAiProbeFailures = 0;
-        this.aiWsDeadTicks = 0;
         this.status.aiPageResponsive = true;
         this.status.aiPageRecycles = (this.status.aiPageRecycles ?? 0) + 1;
         // If a call is active, try to re-establish the AI session
@@ -651,9 +653,12 @@ export class BridgeOrchestrator {
       this.callTracker.silentAiAudio = true;
       this.logger.error('Silent AI audio detected — caller likely hears nothing', { aiLevel });
       this.writeStatusFile(['silent_ai_audio: no audio from AI to caller direction']);
+      // Mid-call recycle is last-resort only. Grok often stays quiet
+      // while listening; tearing the page down just as the greeting
+      // starts is how callers waited 30s to hear anything.
       if (!this.aiRecoveredThisCall && this.status.inCall) {
         this.aiRecoveredThisCall = true;
-        this.logger.warn('Recycling AI page to recover a silent Grok session');
+        this.logger.warn('Silent AI persisted after greeting window — recycling once');
         await this.recyclePage('ai', 'silent AI audio during call');
       }
     }
@@ -717,8 +722,11 @@ export class BridgeOrchestrator {
     }
 
     // WebSocket liveness — a Google Voice page with no open websockets is
-    // deaf: it will never show an incoming call. Same for grok.com: a
-    // dead backend means voice mode cannot start. Idle only.
+    // deaf: it will never show an incoming call. Idle only.
+    // grok.com is intentionally not checked: it often has zero CDP-visible
+    // websockets (HTTP/2 / sockets opened before Network.enable), and
+    // recycling it every 30s exhausted the budget and restarted the
+    // service — then delayed the next call by another full grok.com load.
     if (!this.status.inCall && this.status.running) {
       const openWs = this.browserManager.getOpenWebSocketCount('voice');
       if (openWs === 0) {
@@ -729,17 +737,6 @@ export class BridgeOrchestrator {
         }
       } else {
         this.wsDeadTicks = 0;
-      }
-
-      const aiWs = this.browserManager.getOpenWebSocketCount('ai');
-      if (aiWs === 0) {
-        this.aiWsDeadTicks++;
-        if (this.aiWsDeadTicks >= WS_DEAD_TICKS_THRESHOLD) {
-          this.aiWsDeadTicks = 0;
-          await this.recyclePage('ai', 'AI page has no open websockets (backend connection lost)');
-        }
-      } else {
-        this.aiWsDeadTicks = 0;
       }
     }
 

@@ -244,7 +244,22 @@ describe('GrokProvider', () => {
       expect(result).toBe(true);
     });
 
-    it('returns true when RTC hooks report a live audio track', async () => {
+    it('returns true when RTC hooks report a live audio track and a connected peer', async () => {
+      const page = {
+        waitForTimeout: jest.fn().mockResolvedValue(undefined),
+        evaluate: jest.fn().mockResolvedValue({ liveAudioTrack: true, connectedPeer: true }),
+        locator: jest.fn().mockImplementation(() => ({
+          count: jest.fn().mockResolvedValue(0),
+          first: jest.fn().mockReturnThis(),
+          isVisible: jest.fn().mockResolvedValue(false),
+          textContent: jest.fn().mockResolvedValue(''),
+        })),
+      } as any;
+      const result = await provider.verifyVoiceSession(page, silentLogger as any);
+      expect(result).toBe(true);
+    });
+
+    it('still accepts a live mic track if the peer has not connected by the deadline', async () => {
       const page = {
         waitForTimeout: jest.fn().mockResolvedValue(undefined),
         evaluate: jest.fn().mockResolvedValue({ liveAudioTrack: true, connectedPeer: false }),

@@ -195,10 +195,12 @@ export class GrokProvider implements AIProvider {
         if (await this.hasQuotaBlock(page, quotaPattern, logger)) return false;
 
         const rtcState = await this.readRtcState(page);
-        // A leftover RTCPeerConnection from a previous call is not proof.
-        // Require a live mic track — that only appears after a fresh
-        // getUserMedia, which we reset just before clicking voice.
-        if (rtcState?.liveAudioTrack) {
+        // A leftover RTCPeerConnection from a previous call is not proof
+        // (hooks are reset just before the click). Prefer a live mic
+        // track AND a connected peer — getUserMedia comes up first,
+        // Grok's voice peer a second or two later. Returning on the
+        // mic alone used to mark BRIDGED before Grok could speak.
+        if (rtcState?.liveAudioTrack && rtcState?.connectedPeer) {
           logger.info('Voice session verified via RTC hooks', rtcState);
           return true;
         }

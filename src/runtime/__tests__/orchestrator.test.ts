@@ -412,17 +412,15 @@ describe('BridgeOrchestrator', () => {
       expect(exitSpy).not.toHaveBeenCalled();
     });
 
-    it('recycles the AI page when grok.com has no open websockets while idle', async () => {
+    it('does not recycle the AI page just because grok.com has no CDP websockets', async () => {
       (mocks.browserManager.getOpenWebSocketCount as jest.Mock).mockImplementation((role: string) =>
         role === 'ai' ? 0 : 1,
       );
 
       await (orchestrator as any).runHealthTick();
       await (orchestrator as any).runHealthTick();
-      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
-
       await (orchestrator as any).runHealthTick();
-      expect(mocks.browserManager.recyclePage).toHaveBeenCalledWith('ai');
+      expect(mocks.browserManager.recyclePage).not.toHaveBeenCalled();
       expect(exitSpy).not.toHaveBeenCalled();
     });
 
