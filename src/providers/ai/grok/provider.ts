@@ -110,6 +110,8 @@ export class GrokProvider implements AIProvider {
           await page.keyboard.press('Control+Shift+O').catch(() => undefined);
           await page.waitForTimeout(400);
         }
+        // OneTrust often pops after getUserMedia and stalls "Connecting..."
+        await this.dismissCookieConsent(page, logger);
         this.voiceModeActive = true;
         await this.dumpGrokState(page, logger, 'after-activate');
         return true;
@@ -183,31 +185,28 @@ export class GrokProvider implements AIProvider {
   async verifyVoiceSession(page: Page, logger: Logger): Promise<boolean> {
     try {
       const quotaPattern = /upgrade|subscribe|super ?grok|credit|limit reached|try again later|unavailable/i;
-      const deadline = Date.now() + 8000;
+      const deadline = Date.now() + 2500;
       let iterations = 0;
 
-      while (Date.now() < deadline && iterations < 20) {
+      while (Date.now() < deadline && iterations < 8) {
         iterations++;
         if (await this.hasQuotaBlock(page, quotaPattern, logger)) return false;
 
         const rtcState = await this.readRtcState(page);
-        // A leftover RTCPeerConnection from a previous call is not proof
-        // (hooks are reset just before the click). Prefer a live mic
-        // track AND a connected peer — getUserMedia comes up first,
-        // Grok's voice peer a second or two later. Returning on the
-        // mic alone used to mark BRIDGED before Grok could speak.
-        if (rtcState?.liveAudioTrack && rtcState?.connectedPeer) {
+        // grok.com does not expose a hooked RTCPeerConnection (peers
+        // stay []). A live mic track or the Connecting… control means
+        // voice mode started — do not sit here for 8s delaying audio
+        // routing while Grok finishes connecting.
+        if (rtcState?.liveAudioTrack) {
           logger.info('Voice session verified via RTC hooks', rtcState);
           return true;
         }
-
-        const uiActive = await this.isVoiceUiActive(page);
-        if (uiActive && rtcState?.connectedPeer) {
-          logger.info('Voice session verified via UI + connected peer', rtcState);
+        if (await this.isVoiceConnectingOrActive(page)) {
+          logger.info('Voice session verified via Connecting/active UI');
           return true;
         }
 
-        await page.waitForTimeout(400);
+        await page.waitForTimeout(200);
       }
 
       if (await this.hasQuotaBlock(page, quotaPattern, logger)) return false;
@@ -382,11 +381,18 @@ export class GrokProvider implements AIProvider {
     }
   }
 
+  private async isVoiceConnectingOrActive(page: Page): Promise<boolean> {
+    const connecting = page.locator('button[aria-label*="Connecting" i], [aria-label*="Connecting" i]').first();
+    if ((await connecting.count()) > 0 && (await this.visible(connecting))) return true;
+    return this.isVoiceUiActive(page);
+  }
+
   private async isVoiceUiActive(page: Page): Promise<boolean> {
     const enter = page.locator('button[aria-label*="Enter voice mode" i]').first();
     if ((await enter.count()) > 0 && (await this.visible(enter))) return false;
 
     const activeSelectors = [
+      'button[aria-label*="Connecting" i]',
       'button[aria-label*="stop" i]',
       'button[aria-label*="end" i]',
       'button[aria-label*="mute" i]',
@@ -419,12 +425,41 @@ export class GrokProvider implements AIProvider {
   }
 
   private async dismissCookieConsent(page: Page, logger: Logger): Promise<void> {
+    const selectors = [
+      '#onetrust-accept-btn-handler',
+      'button#onetrust-accept-btn-handler',
+      'button:has-text("Allow All")',
+      'button:has-text("Accept All")',
+      'button.ot-pc-refuse-all-handler',
+      'button.save-preference-btn-handler',
+      'button[aria-label="Close preference center"]',
+      '#onetrust-close-btn-container button',
+    ];
+    const clickIn = async (root: { locator: (sel: string) => { first: () => {
+      count: () => Promise<number>;
+      isVisible: (opts?: { timeout?: number }) => Promise<boolean>;
+      click: (opts: object) => Promise<unknown>;
+    } } }) => {
+      for (const sel of selectors) {
+        const btn = root.locator(sel).first();
+        if ((await btn.count()) === 0) continue;
+        try {
+          await btn.click({ force: true, timeout: 1500, noWaitAfter: true });
+          logger.info('Dismissed cookie / OneTrust dialog', { selector: sel });
+          await page.waitForTimeout(300);
+          return true;
+        } catch {
+          // try next
+        }
+      }
+      return false;
+    };
+
     try {
-      const consentBtn = page.locator('button:has-text("Allow All"), button.ot-pc-refuse-all-handler, button.save-preference-btn-handler').first();
-      if ((await consentBtn.count()) > 0 && (await consentBtn.isVisible().catch(() => false))) {
-        await consentBtn.click();
-        logger.debug('Dismissed cookie consent dialog');
-        await page.waitForTimeout(500);
+      if (await clickIn(page)) return;
+      const frames = typeof page.frames === 'function' ? page.frames() : [];
+      for (const frame of frames) {
+        if (await clickIn(frame as unknown as Parameters<typeof clickIn>[0])) return;
       }
     } catch {
       // ignore

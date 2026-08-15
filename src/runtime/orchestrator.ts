@@ -328,11 +328,12 @@ export class BridgeOrchestrator {
       }
 
       this.transition('ACTIVATE_AI');
-      const verified = await this.ensureVoiceSession(true);
-
-      // Assert audio routing now, then keep it asserted event-driven.
+      // Route audio before / while Grok finishes "Connecting..." so the
+      // greeting is not delayed by an 8s verification wait.
       this.assertAudioRouting();
       this.audioPipeline.startEventRouter(() => this.assertAudioRouting());
+
+      const verified = await this.ensureVoiceSession(true);
       this.startAudioSampling();
 
       // The call may have ended while activation/verification was in flight
